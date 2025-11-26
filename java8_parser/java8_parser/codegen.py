@@ -14,8 +14,9 @@ from .types import (
 )
 from .classfile import (
     ClassFile, MethodInfo, FieldInfo, CodeAttribute, BytecodeBuilder,
-    AccessFlags,
+    AccessFlags, AnnotationInfo,
 )
+from .classreader import ClassPath, ClassInfo as ReadClassInfo, MethodInfo as ReadMethodInfo, FieldInfo as ReadFieldInfo
 
 
 class CompileError(Exception):
@@ -54,17 +55,500 @@ class MethodContext:
         return self.locals[name]
 
 
+@dataclass
+class ResolvedMethod:
+    """A resolved method from the classpath."""
+    owner: str
+    name: str
+    descriptor: str
+    is_static: bool
+    is_interface: bool
+    return_type: JType
+    param_types: tuple[JType, ...]
+
+
+JAVA_LANG_CLASSES = {
+    "Object", "String", "Class", "System", "Thread", "Throwable",
+    "Exception", "RuntimeException", "Error",
+    "Math", "StrictMath", "Number",
+    "Byte", "Short", "Integer", "Long", "Float", "Double", "Character", "Boolean",
+    "StringBuilder", "StringBuffer",
+    "Comparable", "Cloneable", "Runnable", "Iterable", "AutoCloseable",
+    "Enum", "Void",
+    # Annotations
+    "Deprecated", "Override", "SuppressWarnings", "SafeVarargs", "FunctionalInterface",
+}
+
+
+@dataclass
+class LocalMethodInfo:
+    """Info about a method defined in the current class."""
+    name: str
+    descriptor: str
+    is_static: bool
+    return_type: JType
+    param_types: tuple[JType, ...]
+
+
 class CodeGenerator:
     """Generates bytecode from AST."""
 
-    def __init__(self):
+    def __init__(self, classpath: Optional[ClassPath] = None):
         self.class_file: Optional[ClassFile] = None
         self.class_name: str = ""
         self._label_counter = 0
+        self.classpath = classpath
+        self._class_cache: dict[str, ReadClassInfo] = {}
+        self._local_methods: dict[str, list[LocalMethodInfo]] = {}  # method_name -> list of overloads
+
+    def _resolve_class_name(self, name: str) -> str:
+        """Resolve a simple class name to its full internal name."""
+        # Already qualified
+        if "/" in name or "." in name:
+            return name.replace(".", "/")
+        # Check if it's a java.lang class
+        if name in JAVA_LANG_CLASSES:
+            return f"java/lang/{name}"
+        # Check if it's the current class
+        if name == self.class_name or name == self.class_name.split("/")[-1]:
+            return self.class_name
+        # Otherwise assume it's in the default package or same package
+        return name
 
     def new_label(self, prefix: str = "L") -> str:
         self._label_counter += 1
         return f"{prefix}{self._label_counter}"
+
+    def _lookup_class(self, name: str) -> Optional[ReadClassInfo]:
+        """Look up a class from the classpath."""
+        if name in self._class_cache:
+            return self._class_cache[name]
+        if self.classpath:
+            cls = self.classpath.find_class(name)
+            if cls:
+                self._class_cache[name] = cls
+            return cls
+        return None
+
+    def _find_method(self, class_name: str, method_name: str,
+                     arg_types: list[JType]) -> Optional[ResolvedMethod]:
+        """Find a method in a class that matches the given name and argument types."""
+        # Check if looking in the current class being compiled
+        if class_name == self.class_name and method_name in self._local_methods:
+            for local_method in self._local_methods[method_name]:
+                if len(local_method.param_types) == len(arg_types):
+                    return ResolvedMethod(
+                        owner=self.class_name,
+                        name=method_name,
+                        descriptor=local_method.descriptor,
+                        is_static=local_method.is_static,
+                        is_interface=False,
+                        return_type=local_method.return_type,
+                        param_types=local_method.param_types,
+                    )
+
+        cls = self._lookup_class(class_name)
+        if not cls:
+            return None
+
+        # Check if it's an interface
+        is_interface = (cls.access_flags & AccessFlags.INTERFACE) != 0
+
+        # Collect all matching methods
+        candidates = []
+        current = cls
+        while current:
+            for method in current.methods:
+                if method.name != method_name:
+                    continue
+                return_type, param_types = self._parse_method_descriptor(method.descriptor)
+                if len(param_types) != len(arg_types):
+                    continue
+                # Check type compatibility
+                if self._args_compatible(arg_types, param_types):
+                    is_static = (method.access_flags & AccessFlags.STATIC) != 0
+                    candidates.append(ResolvedMethod(
+                        owner=current.name,
+                        name=method_name,
+                        descriptor=method.descriptor,
+                        is_static=is_static,
+                        is_interface=is_interface,
+                        return_type=return_type,
+                        param_types=param_types,
+                    ))
+            if current.super_class:
+                current = self._lookup_class(current.super_class)
+            else:
+                break
+
+        # Pick the most specific method
+        if candidates:
+            return self._most_specific_method(candidates, arg_types)
+
+        # Check interfaces for default methods
+        if cls.interfaces:
+            for iface_name in cls.interfaces:
+                result = self._find_method(iface_name, method_name, arg_types)
+                if result:
+                    return result
+
+        return None
+
+    def _args_compatible(self, arg_types: list[JType], param_types: tuple[JType, ...]) -> bool:
+        """Check if argument types are compatible with parameter types."""
+        for arg, param in zip(arg_types, param_types):
+            if not self._type_assignable(arg, param):
+                return False
+        return True
+
+    def _type_assignable(self, from_type: JType, to_type: JType) -> bool:
+        """Check if from_type can be assigned to to_type."""
+        # Same type is always assignable
+        if from_type == to_type:
+            return True
+
+        # Integer widening: byte -> short -> int -> long
+        # Also: byte/short/char -> int
+        integer_types = {BYTE, SHORT, CHAR, INT, LONG}
+        if from_type in integer_types and to_type in integer_types:
+            widening_order = [BYTE, SHORT, CHAR, INT, LONG]
+            from_idx = widening_order.index(from_type) if from_type in widening_order else -1
+            to_idx = widening_order.index(to_type) if to_type in widening_order else -1
+            # char is a bit special, but for simplicity treat byte/short/char as convertible to int
+            if from_type in {BYTE, SHORT, CHAR} and to_type == INT:
+                return True
+            if from_idx <= to_idx and from_idx >= 0:
+                return True
+
+        # Float widening: float -> double
+        if from_type == FLOAT and to_type == DOUBLE:
+            return True
+
+        # Int to float/double (widening)
+        if from_type in {BYTE, SHORT, CHAR, INT} and to_type in {FLOAT, DOUBLE}:
+            return True
+        if from_type == LONG and to_type in {FLOAT, DOUBLE}:
+            return True
+
+        # Object is assignable from any reference type
+        if isinstance(to_type, ClassJType) and to_type.internal_name() == "java/lang/Object":
+            if isinstance(from_type, (ClassJType, ArrayJType)):
+                return True
+
+        # Subtyping for reference types (simplified - just check if same or Object)
+        if isinstance(from_type, ClassJType) and isinstance(to_type, ClassJType):
+            if from_type.internal_name() == to_type.internal_name():
+                return True
+
+        return False
+
+    def _most_specific_method(self, candidates: list[ResolvedMethod], arg_types: list[JType]) -> ResolvedMethod:
+        """Select the most specific method from candidates."""
+        if len(candidates) == 1:
+            return candidates[0]
+
+        # Prefer methods with primitive parameters over Object parameters
+        # This handles println(int) vs println(Object) for byte/short args
+        best = candidates[0]
+        for candidate in candidates[1:]:
+            if self._method_more_specific(candidate, best, arg_types):
+                best = candidate
+        return best
+
+    def _method_more_specific(self, m1: ResolvedMethod, m2: ResolvedMethod, arg_types: list[JType]) -> bool:
+        """Check if m1 is more specific than m2 for the given argument types."""
+        # A method is more specific if its parameter types are more specific
+        for p1, p2, arg in zip(m1.param_types, m2.param_types, arg_types):
+            if p1 == p2:
+                continue
+            # Primitive is more specific than Object
+            if isinstance(p2, ClassJType) and p2.internal_name() == "java/lang/Object":
+                if isinstance(p1, PrimitiveJType) or (isinstance(p1, ClassJType) and p1.internal_name() != "java/lang/Object"):
+                    return True
+            # Narrower primitive is more specific
+            if isinstance(p1, PrimitiveJType) and isinstance(p2, PrimitiveJType):
+                widening = [BYTE, SHORT, CHAR, INT, LONG, FLOAT, DOUBLE]
+                if p1 in widening and p2 in widening:
+                    if widening.index(p1) < widening.index(p2):
+                        return True
+        return False
+
+    def _find_field(self, class_name: str, field_name: str) -> Optional[tuple[str, str, JType]]:
+        """Find a field in a class. Returns (owner, descriptor, type)."""
+        cls = self._lookup_class(class_name)
+        if not cls:
+            return None
+
+        current = cls
+        while current:
+            for fld in current.fields:
+                if fld.name == field_name:
+                    jtype = self._descriptor_to_type(fld.descriptor)
+                    return (current.name, fld.descriptor, jtype)
+            if current.super_class:
+                current = self._lookup_class(current.super_class)
+            else:
+                break
+        return None
+
+    def _parse_method_descriptor(self, descriptor: str) -> tuple[JType, tuple[JType, ...]]:
+        """Parse a method descriptor into return type and parameter types."""
+        params = []
+        i = 1  # Skip '('
+        while descriptor[i] != ')':
+            jtype, consumed = self._parse_type_from_descriptor(descriptor, i)
+            params.append(jtype)
+            i += consumed
+        i += 1  # Skip ')'
+        return_type, _ = self._parse_type_from_descriptor(descriptor, i)
+        return return_type, tuple(params)
+
+    def _parse_type_from_descriptor(self, desc: str, pos: int) -> tuple[JType, int]:
+        """Parse a single type from a descriptor at the given position."""
+        ch = desc[pos]
+        if ch == 'B':
+            return BYTE, 1
+        elif ch == 'C':
+            return CHAR, 1
+        elif ch == 'D':
+            return DOUBLE, 1
+        elif ch == 'F':
+            return FLOAT, 1
+        elif ch == 'I':
+            return INT, 1
+        elif ch == 'J':
+            return LONG, 1
+        elif ch == 'S':
+            return SHORT, 1
+        elif ch == 'Z':
+            return BOOLEAN, 1
+        elif ch == 'V':
+            return VOID, 1
+        elif ch == 'L':
+            end = desc.index(';', pos)
+            class_name = desc[pos + 1:end]
+            return ClassJType(class_name), end - pos + 1
+        elif ch == '[':
+            elem_type, consumed = self._parse_type_from_descriptor(desc, pos + 1)
+            if isinstance(elem_type, ArrayJType):
+                return ArrayJType(elem_type.element_type, elem_type.dimensions + 1), consumed + 1
+            return ArrayJType(elem_type, 1), consumed + 1
+        else:
+            raise CompileError(f"Unknown descriptor char: {ch}")
+
+    def _descriptor_to_type(self, desc: str) -> JType:
+        """Convert a full descriptor to a JType."""
+        jtype, _ = self._parse_type_from_descriptor(desc, 0)
+        return jtype
+
+    def _register_local_method(self, method: ast.MethodDeclaration):
+        """Register a method for forward reference resolution."""
+        is_static = any(m.keyword == "static" for m in method.modifiers)
+        return_type = self.resolve_type(method.return_type)
+        param_types = tuple(self.resolve_type(p.type) for p in method.parameters)
+        descriptor = MethodType(return_type, param_types).descriptor()
+
+        info = LocalMethodInfo(
+            name=method.name,
+            descriptor=descriptor,
+            is_static=is_static,
+            return_type=return_type,
+            param_types=param_types,
+        )
+
+        if method.name not in self._local_methods:
+            self._local_methods[method.name] = []
+        self._local_methods[method.name].append(info)
+
+    def _convert_annotations(self, modifiers: tuple) -> list[AnnotationInfo]:
+        """Convert AST annotations from modifiers to AnnotationInfo list."""
+        annotations = []
+        for mod in modifiers:
+            if mod.annotation:
+                ann = self._convert_annotation(mod.annotation)
+                annotations.append(ann)
+        return annotations
+
+    def _convert_annotation(self, ann: ast.Annotation) -> AnnotationInfo:
+        """Convert an AST Annotation to AnnotationInfo."""
+        # Resolve annotation type name to descriptor
+        type_name = self._resolve_class_name(ann.name)
+        type_desc = f"L{type_name};"
+
+        elements = {}
+        for arg in ann.arguments:
+            name = arg.name if arg.name else "value"
+            tag, value = self._convert_annotation_value(arg.value)
+            elements[name] = (tag, value)
+
+        return AnnotationInfo(type_descriptor=type_desc, elements=elements)
+
+    def _convert_annotation_value(self, expr: ast.Expression) -> tuple[str, any]:
+        """Convert an annotation element value to (tag, value)."""
+        if isinstance(expr, ast.Literal):
+            if expr.kind == "int":
+                return ('I', self.parse_int_literal(expr.value))
+            elif expr.kind == "long":
+                return ('J', self.parse_long_literal(expr.value))
+            elif expr.kind == "float":
+                return ('F', float(expr.value.rstrip("fF")))
+            elif expr.kind == "double":
+                return ('D', float(expr.value.rstrip("dD")))
+            elif expr.kind == "boolean":
+                return ('Z', 1 if expr.value == "true" else 0)
+            elif expr.kind == "char":
+                s = expr.value[1:-1]
+                if s.startswith("\\"):
+                    return ('C', self.parse_escape(s))
+                return ('C', ord(s))
+            elif expr.kind == "string":
+                return ('s', self.parse_string_literal(expr.value))
+        elif isinstance(expr, ast.ClassLiteral):
+            jtype = self.resolve_type(expr.type)
+            return ('c', jtype.descriptor())
+        elif isinstance(expr, ast.FieldAccess):
+            # Enum constant: SomeEnum.VALUE
+            if isinstance(expr.target, ast.Identifier):
+                enum_type = self._resolve_class_name(expr.target.name)
+                return ('e', (f"L{enum_type};", expr.field))
+            elif isinstance(expr.target, ast.QualifiedName):
+                enum_type = "/".join(expr.target.parts)
+                return ('e', (f"L{enum_type};", expr.field))
+        elif isinstance(expr, ast.ArrayInitializer):
+            # Array of values
+            values = [self._convert_annotation_value(e) for e in expr.elements]
+            return ('[', values)
+        elif isinstance(expr, ast.Annotation):
+            # Nested annotation
+            return ('@', self._convert_annotation(expr))
+        elif isinstance(expr, ast.Identifier):
+            # Could be an enum constant in the same context
+            return ('s', expr.name)
+
+        raise CompileError(f"Unsupported annotation value: {type(expr).__name__}")
+
+    def _generate_type_param_signature(self, tp: ast.TypeParameter) -> str:
+        """Generate signature for a type parameter declaration."""
+        sig = tp.name + ":"
+        if tp.bounds:
+            for i, bound in enumerate(tp.bounds):
+                if i > 0:
+                    sig += ":"
+                sig += self._generate_type_signature(bound)
+        else:
+            sig += "Ljava/lang/Object;"
+        return sig
+
+    def _generate_type_params_signature(self, type_params: tuple) -> str:
+        """Generate signature for type parameters."""
+        if not type_params:
+            return ""
+        sigs = [self._generate_type_param_signature(tp) for tp in type_params]
+        return "<" + "".join(sigs) + ">"
+
+    def _generate_type_signature(self, type_node) -> str:
+        """Generate signature for a type reference."""
+        if isinstance(type_node, ast.ClassType):
+            name = type_node.name
+            if name in ("int", "byte", "short", "long", "float", "double", "boolean", "char", "void"):
+                descriptors = {
+                    "int": "I", "byte": "B", "short": "S", "long": "J",
+                    "float": "F", "double": "D", "boolean": "Z", "char": "C", "void": "V"
+                }
+                return descriptors[name]
+            if hasattr(self, '_type_param_names') and name in self._type_param_names:
+                return f"T{name};"
+            full_name = self._resolve_class_name(name)
+            sig = f"L{full_name}"
+            if type_node.type_arguments:
+                sig += "<"
+                for ta in type_node.type_arguments:
+                    sig += self._generate_type_argument_signature(ta)
+                sig += ">"
+            sig += ";"
+            return sig
+        elif isinstance(type_node, ast.ArrayType):
+            return "[" * type_node.dimensions + self._generate_type_signature(type_node.element_type)
+        elif isinstance(type_node, ast.PrimitiveType):
+            descriptors = {
+                "int": "I", "byte": "B", "short": "S", "long": "J",
+                "float": "F", "double": "D", "boolean": "Z", "char": "C", "void": "V"
+            }
+            return descriptors[type_node.name]
+        else:
+            return "Ljava/lang/Object;"
+
+    def _generate_type_argument_signature(self, ta) -> str:
+        """Generate signature for a type argument."""
+        if isinstance(ta, ast.WildcardType):
+            if ta.extends:
+                return "+" + self._generate_type_signature(ta.extends)
+            elif ta.super_:
+                return "-" + self._generate_type_signature(ta.super_)
+            else:
+                return "*"
+        else:
+            return self._generate_type_signature(ta)
+
+    def _generate_class_signature(self, cls: ast.ClassDeclaration) -> Optional[str]:
+        """Generate class signature if class has type parameters."""
+        if not cls.type_parameters:
+            return None
+        self._type_param_names = {tp.name for tp in cls.type_parameters}
+        sig = self._generate_type_params_signature(cls.type_parameters)
+        if cls.extends:
+            sig += self._generate_type_signature(cls.extends)
+        else:
+            sig += "Ljava/lang/Object;"
+        for iface in cls.implements:
+            sig += self._generate_type_signature(iface)
+        return sig
+
+    def _generate_method_signature(self, method: ast.MethodDeclaration, class_type_params: set[str]) -> Optional[str]:
+        """Generate method signature if method uses generics."""
+        self._type_param_names = class_type_params.copy()
+        for tp in method.type_parameters:
+            self._type_param_names.add(tp.name)
+
+        has_generics = bool(method.type_parameters)
+        if not has_generics:
+            if self._type_uses_generics(method.return_type, self._type_param_names):
+                has_generics = True
+            else:
+                for param in method.parameters:
+                    if self._type_uses_generics(param.type, self._type_param_names):
+                        has_generics = True
+                        break
+
+        if not has_generics:
+            return None
+
+        sig = self._generate_type_params_signature(method.type_parameters)
+        sig += "("
+        for param in method.parameters:
+            sig += self._generate_type_signature(param.type)
+        sig += ")"
+        sig += self._generate_type_signature(method.return_type)
+        return sig
+
+    def _type_uses_generics(self, type_node, type_params: set[str]) -> bool:
+        """Check if a type uses any type parameters."""
+        if isinstance(type_node, ast.ClassType):
+            if type_node.name in type_params:
+                return True
+            for ta in type_node.type_arguments:
+                if self._type_uses_generics(ta, type_params):
+                    return True
+            return False
+        elif isinstance(type_node, ast.ArrayType):
+            return self._type_uses_generics(type_node.element_type, type_params)
+        elif isinstance(type_node, ast.WildcardType):
+            if type_node.extends and self._type_uses_generics(type_node.extends, type_params):
+                return True
+            if type_node.super_ and self._type_uses_generics(type_node.super_, type_params):
+                return True
+            return False
+        return False
 
     def compile(self, unit: ast.CompilationUnit) -> dict[str, bytes]:
         """Compile a compilation unit to class files."""
@@ -79,6 +563,9 @@ class CodeGenerator:
         """Compile a class declaration."""
         self.class_name = cls.name
         self.class_file = ClassFile(cls.name)
+
+        # Store class type parameters for method signature generation
+        self._class_type_params = {tp.name for tp in cls.type_parameters}
 
         # Set access flags
         flags = AccessFlags.SUPER
@@ -95,7 +582,19 @@ class CodeGenerator:
                 flags |= AccessFlags.ABSTRACT
         self.class_file.access_flags = flags
 
-        # Process members
+        # Add class annotations
+        self.class_file.annotations = self._convert_annotations(cls.modifiers)
+
+        # Generate class signature for generics
+        self.class_file.signature = self._generate_class_signature(cls)
+
+        # First pass: collect method signatures for forward references
+        self._local_methods = {}
+        for member in cls.body:
+            if isinstance(member, ast.MethodDeclaration):
+                self._register_local_method(member)
+
+        # Second pass: compile members
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
                 self.compile_method(member)
@@ -122,11 +621,13 @@ class CodeGenerator:
                 flags |= AccessFlags.FINAL
 
         jtype = self.resolve_type(fld.type)
+        annotations = self._convert_annotations(fld.modifiers)
         for decl in fld.declarators:
             field_info = FieldInfo(
                 access_flags=flags,
                 name=decl.name,
-                descriptor=jtype.descriptor()
+                descriptor=jtype.descriptor(),
+                annotations=annotations
             )
             self.class_file.add_field(field_info)
 
@@ -204,13 +705,22 @@ class CodeGenerator:
         return_type = self.resolve_type(method.return_type)
         descriptor = MethodType(return_type, tuple(param_types)).descriptor()
 
+        # Collect annotations
+        annotations = self._convert_annotations(method.modifiers)
+
+        # Collect throws as internal names
+        throws_list = [self._resolve_class_name(t.name) if isinstance(t, ast.ClassType) else str(t)
+                       for t in method.throws]
+
         # Abstract/native methods have no code
         if method.body is None:
             method_info = MethodInfo(
                 access_flags=flags,
                 name=method.name,
                 descriptor=descriptor,
-                code=None
+                code=None,
+                annotations=annotations,
+                exceptions=throws_list
             )
             self.class_file.add_method(method_info)
             return
@@ -242,7 +752,9 @@ class CodeGenerator:
             access_flags=flags,
             name=method.name,
             descriptor=descriptor,
-            code=builder.build()
+            code=builder.build(),
+            annotations=annotations,
+            exceptions=throws_list
         )
         self.class_file.add_method(method_info)
 
@@ -481,6 +993,45 @@ class CodeGenerator:
 
         else:
             raise CompileError(f"Unsupported expression type: {type(expr).__name__}")
+
+    def _estimate_expression_type(self, expr, ctx: MethodContext) -> JType:
+        """Estimate the type of an expression without generating code."""
+        if isinstance(expr, ast.Literal):
+            if expr.kind == "int":
+                return INT
+            elif expr.kind == "long":
+                return LONG
+            elif expr.kind == "float":
+                return FLOAT
+            elif expr.kind == "double":
+                return DOUBLE
+            elif expr.kind == "boolean":
+                return BOOLEAN
+            elif expr.kind == "char":
+                return CHAR
+            elif expr.kind == "string":
+                return STRING
+            elif expr.kind == "null":
+                return ClassJType("java/lang/Object")
+        elif isinstance(expr, ast.Identifier):
+            if expr.name in ctx.locals:
+                return ctx.get_local(expr.name).type
+            return ClassJType("java/lang/Object")
+        elif isinstance(expr, ast.BinaryExpression):
+            left_type = self._estimate_expression_type(expr.left, ctx)
+            right_type = self._estimate_expression_type(expr.right, ctx)
+            if left_type == LONG or right_type == LONG:
+                return LONG
+            if left_type == DOUBLE or right_type == DOUBLE:
+                return DOUBLE
+            if left_type == FLOAT or right_type == FLOAT:
+                return FLOAT
+            return INT
+        elif isinstance(expr, ast.UnaryExpression):
+            return self._estimate_expression_type(expr.operand, ctx)
+        elif isinstance(expr, ast.ParenthesizedExpression):
+            return self._estimate_expression_type(expr.expression, ctx)
+        return ClassJType("java/lang/Object")
 
     def compile_literal(self, lit: ast.Literal, ctx: MethodContext) -> JType:
         builder = ctx.builder
@@ -809,7 +1360,7 @@ class CodeGenerator:
     def compile_method_call(self, expr: ast.MethodInvocation, ctx: MethodContext) -> JType:
         builder = ctx.builder
 
-        # Check for System.out.println/print
+        # Check for System.out.println/print (hardcoded common case)
         is_system_out = False
         if isinstance(expr.target, ast.FieldAccess):
             if (isinstance(expr.target.target, ast.Identifier) and
@@ -825,7 +1376,7 @@ class CodeGenerator:
                 builder.getstatic("java/lang/System", "out", "Ljava/io/PrintStream;")
                 if expr.arguments:
                     arg_type = self.compile_expression(expr.arguments[0], ctx)
-                    if arg_type == INT:
+                    if arg_type in {INT, BYTE, SHORT}:
                         builder.invokevirtual("java/io/PrintStream", "println", "(I)V", 1, 0)
                     elif arg_type == LONG:
                         builder.invokevirtual("java/io/PrintStream", "println", "(J)V", 2, 0)
@@ -835,6 +1386,8 @@ class CodeGenerator:
                         builder.invokevirtual("java/io/PrintStream", "println", "(D)V", 2, 0)
                     elif arg_type == BOOLEAN:
                         builder.invokevirtual("java/io/PrintStream", "println", "(Z)V", 1, 0)
+                    elif arg_type == CHAR:
+                        builder.invokevirtual("java/io/PrintStream", "println", "(C)V", 1, 0)
                     elif arg_type == STRING:
                         builder.invokevirtual("java/io/PrintStream", "println",
                                               "(Ljava/lang/String;)V", 1, 0)
@@ -849,14 +1402,141 @@ class CodeGenerator:
                 builder.getstatic("java/lang/System", "out", "Ljava/io/PrintStream;")
                 if expr.arguments:
                     arg_type = self.compile_expression(expr.arguments[0], ctx)
-                    if arg_type == INT:
+                    if arg_type in {INT, BYTE, SHORT}:
                         builder.invokevirtual("java/io/PrintStream", "print", "(I)V", 1, 0)
+                    elif arg_type == CHAR:
+                        builder.invokevirtual("java/io/PrintStream", "print", "(C)V", 1, 0)
                     elif arg_type == STRING:
                         builder.invokevirtual("java/io/PrintStream", "print",
                                               "(Ljava/lang/String;)V", 1, 0)
+                    else:
+                        builder.invokevirtual("java/io/PrintStream", "print",
+                                              "(Ljava/lang/Object;)V", 1, 0)
                 return VOID
 
-        raise CompileError(f"Unsupported method call: {expr.method}")
+        # Try to resolve using classpath
+        return self._compile_general_method_call(expr, ctx)
+
+    def _compile_general_method_call(self, expr: ast.MethodInvocation, ctx: MethodContext) -> JType:
+        """Compile a general method call using classpath resolution."""
+        builder = ctx.builder
+
+        # Determine the target type (but don't load it yet - need to check if static first)
+        target_type = None
+        is_static_call = False
+        needs_this_load = False  # Will be set if we need to load 'this' later
+
+        if expr.target is None:
+            # Method call on this (or static call to same class - need to check later)
+            target_type = ClassJType(self.class_name)
+            needs_this_load = True  # Tentatively - will skip if method is static
+        elif isinstance(expr.target, ast.Identifier):
+            # Could be a local variable or a class name
+            if expr.target.name in ctx.locals:
+                var = ctx.get_local(expr.target.name)
+                self.load_local(var, builder)
+                target_type = var.type
+            else:
+                # Assume it's a class name (static call)
+                is_static_call = True
+                resolved_name = self._resolve_class_name(expr.target.name)
+                target_type = ClassJType(resolved_name)
+        elif isinstance(expr.target, ast.QualifiedName):
+            # e.g., java.lang.Math.abs() or Math.abs() - class name for static call
+            is_static_call = True
+            if len(expr.target.parts) == 1:
+                # Single name like "Math" - resolve it
+                resolved_name = self._resolve_class_name(expr.target.parts[0])
+                target_type = ClassJType(resolved_name)
+            else:
+                # Qualified name like "java.lang.Math"
+                class_name = "/".join(expr.target.parts)
+                target_type = ClassJType(class_name)
+        elif isinstance(expr.target, ast.FieldAccess):
+            # e.g., obj.field.method()
+            target_type = self._compile_field_access_for_call(expr.target, ctx)
+        else:
+            # Some other expression - compile it
+            target_type = self.compile_expression(expr.target, ctx)
+
+        if not isinstance(target_type, ClassJType):
+            raise CompileError(f"Cannot call method on type: {target_type}")
+
+        # First, determine argument types without compiling them yet
+        # We need to resolve the method first to know if it's static
+        class_internal_name = target_type.internal_name()
+
+        # Estimate arg types for method resolution
+        # Note: This is a simplified approach - we compile args once after knowing the method
+        arg_types_estimate = []
+        for arg in expr.arguments:
+            arg_type = self._estimate_expression_type(arg, ctx)
+            arg_types_estimate.append(arg_type)
+
+        # Try to resolve the method
+        resolved = self._find_method(class_internal_name, expr.method, arg_types_estimate)
+
+        if not resolved:
+            raise CompileError(f"Cannot resolve method: {class_internal_name}.{expr.method}")
+
+        # Now we know if the method is static - load 'this' if needed
+        if needs_this_load and not resolved.is_static:
+            builder.aload(0)  # load 'this'
+
+        # Compile arguments
+        for arg in expr.arguments:
+            self.compile_expression(arg, ctx)
+
+        # Calculate stack effect
+        args_slots = sum(t.size for t in resolved.param_types)
+        return_slots = 0 if resolved.return_type == VOID else resolved.return_type.size
+
+        # Emit the call
+        if is_static_call or resolved.is_static:
+            builder.invokestatic(resolved.owner, resolved.name, resolved.descriptor, args_slots, return_slots)
+        elif resolved.is_interface:
+            builder.invokeinterface(resolved.owner, resolved.name, resolved.descriptor,
+                                    args_slots + 1, return_slots)
+        else:
+            builder.invokevirtual(resolved.owner, resolved.name, resolved.descriptor,
+                                  args_slots + 1, return_slots)
+
+        return resolved.return_type
+
+    def _compile_field_access_for_call(self, fa: ast.FieldAccess, ctx: MethodContext) -> JType:
+        """Compile a field access and return its type (for method calls)."""
+        builder = ctx.builder
+
+        # First compile the target
+        if isinstance(fa.target, ast.Identifier):
+            if fa.target.name in ctx.locals:
+                var = ctx.get_local(fa.target.name)
+                self.load_local(var, builder)
+                target_type = var.type
+            else:
+                # Class name - static field access
+                target_type = ClassJType(fa.target.name)
+                # Look up the field
+                field_info = self._find_field(target_type.internal_name(), fa.field)
+                if field_info:
+                    owner, desc, ftype = field_info
+                    builder.getstatic(owner, fa.field, desc)
+                    return ftype
+                raise CompileError(f"Cannot find field: {fa.target.name}.{fa.field}")
+        else:
+            target_type = self.compile_expression(fa.target, ctx)
+
+        if not isinstance(target_type, ClassJType):
+            raise CompileError(f"Cannot access field on type: {target_type}")
+
+        # Look up the field in the class
+        field_info = self._find_field(target_type.internal_name(), fa.field)
+        if field_info:
+            owner, desc, ftype = field_info
+            builder.getfield(owner, fa.field, desc)
+            return ftype
+
+        raise CompileError(f"Cannot find field: {target_type.internal_name()}.{fa.field}")
 
     def compile_ternary(self, expr: ast.ConditionalExpression, ctx: MethodContext) -> JType:
         builder = ctx.builder
@@ -950,12 +1630,9 @@ class CodeGenerator:
             # Handle void (may come through as ClassType in some cases)
             if t.name == "void":
                 return VOID
-            # Handle some common types
-            if t.name == "String":
-                return STRING
-            elif t.name == "Object":
-                return OBJECT
-            return ClassJType(t.name)
+            # Resolve class name (handles java.lang.* auto-import)
+            resolved_name = self._resolve_class_name(t.name)
+            return ClassJType(resolved_name)
 
         elif isinstance(t, ast.ArrayType):
             elem = self.resolve_type(t.element_type)
@@ -965,7 +1642,7 @@ class CodeGenerator:
             raise CompileError(f"Unsupported type: {type(t).__name__}")
 
 
-def compile_file(source_path: str, output_dir: str = "."):
+def compile_file(source_path: str, output_dir: str = ".", use_rt_jar: bool = True):
     """Compile a Java source file to class file(s)."""
     from .parser import Java8Parser
     from pathlib import Path
@@ -973,7 +1650,17 @@ def compile_file(source_path: str, output_dir: str = "."):
     parser = Java8Parser()
     unit = parser.parse_file(source_path)
 
-    codegen = CodeGenerator()
+    # Set up classpath with rt.jar for method resolution
+    classpath = None
+    if use_rt_jar:
+        try:
+            classpath = ClassPath()
+            classpath.add_rt_jar()
+        except FileNotFoundError:
+            print("Warning: rt.jar not found, method resolution may be limited")
+            classpath = None
+
+    codegen = CodeGenerator(classpath=classpath)
     class_files = codegen.compile(unit)
 
     output_path = Path(output_dir)
@@ -984,5 +1671,9 @@ def compile_file(source_path: str, output_dir: str = "."):
         with open(class_path, "wb") as f:
             f.write(bytecode)
         print(f"Wrote {class_path}")
+
+    # Clean up classpath resources
+    if classpath:
+        classpath.close()
 
     return class_files

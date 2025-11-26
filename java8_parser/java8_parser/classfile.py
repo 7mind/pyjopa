@@ -353,6 +353,72 @@ class ConstantPool:
 
 
 @dataclass
+class AnnotationInfo:
+    """An annotation to write to class file."""
+    type_descriptor: str  # e.g., "Ljava/lang/Deprecated;"
+    elements: dict = field(default_factory=dict)  # name -> (tag, value)
+
+    def write(self, cp: ConstantPool, out: bytearray):
+        type_idx = cp.add_utf8(self.type_descriptor)
+        out.extend(struct.pack(">H", type_idx))
+        out.extend(struct.pack(">H", len(self.elements)))
+        for name, (tag, value) in self.elements.items():
+            name_idx = cp.add_utf8(name)
+            out.extend(struct.pack(">H", name_idx))
+            self._write_element_value(cp, out, tag, value)
+
+    def _write_element_value(self, cp: ConstantPool, out: bytearray, tag: str, value):
+        out.append(ord(tag))
+        if tag == 'B' or tag == 'C' or tag == 'I' or tag == 'S' or tag == 'Z':
+            idx = cp.add_integer(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == 'D':
+            idx = cp.add_double(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == 'F':
+            idx = cp.add_float(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == 'J':
+            idx = cp.add_long(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == 's':
+            idx = cp.add_utf8(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == 'e':
+            # Enum: value is (type_desc, const_name)
+            type_idx = cp.add_utf8(value[0])
+            name_idx = cp.add_utf8(value[1])
+            out.extend(struct.pack(">HH", type_idx, name_idx))
+        elif tag == 'c':
+            # Class: value is class descriptor
+            idx = cp.add_utf8(value)
+            out.extend(struct.pack(">H", idx))
+        elif tag == '@':
+            # Nested annotation
+            value.write(cp, out)
+        elif tag == '[':
+            # Array: value is list of (tag, value)
+            out.extend(struct.pack(">H", len(value)))
+            for elem_tag, elem_value in value:
+                self._write_element_value(cp, out, elem_tag, elem_value)
+
+
+def write_annotations_attribute(cp: ConstantPool, out: bytearray,
+                                attr_name: str, annotations: list[AnnotationInfo]):
+    """Write a RuntimeVisibleAnnotations or RuntimeInvisibleAnnotations attribute."""
+    if not annotations:
+        return
+    attr_name_idx = cp.add_utf8(attr_name)
+    data = bytearray()
+    data.extend(struct.pack(">H", len(annotations)))
+    for ann in annotations:
+        ann.write(cp, data)
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", len(data)))
+    out.extend(data)
+
+
+@dataclass
 class CodeAttribute:
     """Code attribute for a method."""
     max_stack: int = 0
@@ -386,6 +452,9 @@ class MethodInfo:
     name: str
     descriptor: str
     code: Optional[CodeAttribute] = None
+    signature: Optional[str] = None
+    annotations: list = field(default_factory=list)
+    exceptions: list = field(default_factory=list)
 
     def write(self, cp: ConstantPool, out: bytearray):
         name_idx = cp.add_utf8(self.name)
@@ -394,11 +463,26 @@ class MethodInfo:
         out.extend(struct.pack(">H", name_idx))
         out.extend(struct.pack(">H", desc_idx))
 
+        # Count attributes
+        attr_count = 0
         if self.code:
-            out.extend(struct.pack(">H", 1))  # attributes_count
+            attr_count += 1
+        if self.signature:
+            attr_count += 1
+        if self.annotations:
+            attr_count += 1
+        if self.exceptions:
+            attr_count += 1
+
+        out.extend(struct.pack(">H", attr_count))
+        if self.code:
             self.code.write(cp, out)
-        else:
-            out.extend(struct.pack(">H", 0))
+        if self.signature:
+            _write_signature_attribute(cp, out, self.signature)
+        if self.annotations:
+            write_annotations_attribute(cp, out, "RuntimeVisibleAnnotations", self.annotations)
+        if self.exceptions:
+            _write_exceptions_attribute(cp, out, self.exceptions)
 
 
 @dataclass
@@ -407,6 +491,8 @@ class FieldInfo:
     access_flags: int
     name: str
     descriptor: str
+    signature: Optional[str] = None
+    annotations: list = field(default_factory=list)
 
     def write(self, cp: ConstantPool, out: bytearray):
         name_idx = cp.add_utf8(self.name)
@@ -414,7 +500,41 @@ class FieldInfo:
         out.extend(struct.pack(">H", self.access_flags))
         out.extend(struct.pack(">H", name_idx))
         out.extend(struct.pack(">H", desc_idx))
-        out.extend(struct.pack(">H", 0))  # attributes_count
+
+        # Count attributes
+        attr_count = 0
+        if self.signature:
+            attr_count += 1
+        if self.annotations:
+            attr_count += 1
+
+        out.extend(struct.pack(">H", attr_count))
+        if self.signature:
+            _write_signature_attribute(cp, out, self.signature)
+        if self.annotations:
+            write_annotations_attribute(cp, out, "RuntimeVisibleAnnotations", self.annotations)
+
+
+def _write_signature_attribute(cp: ConstantPool, out: bytearray, signature: str):
+    """Write a Signature attribute."""
+    attr_name_idx = cp.add_utf8("Signature")
+    sig_idx = cp.add_utf8(signature)
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", 2))
+    out.extend(struct.pack(">H", sig_idx))
+
+
+def _write_exceptions_attribute(cp: ConstantPool, out: bytearray, exceptions: list[str]):
+    """Write an Exceptions attribute."""
+    attr_name_idx = cp.add_utf8("Exceptions")
+    data = bytearray()
+    data.extend(struct.pack(">H", len(exceptions)))
+    for exc in exceptions:
+        exc_idx = cp.add_class(exc)
+        data.extend(struct.pack(">H", exc_idx))
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", len(data)))
+    out.extend(data)
 
 
 class ClassFile:
@@ -432,6 +552,8 @@ class ClassFile:
         self.fields: list[FieldInfo] = []
         self.methods: list[MethodInfo] = []
         self.cp = ConstantPool()
+        self.signature: Optional[str] = None
+        self.annotations: list[AnnotationInfo] = []
 
     def add_method(self, method: MethodInfo):
         self.methods.append(method)
@@ -458,6 +580,42 @@ class ClassFile:
         # Pre-add "Code" attribute name for methods with code
         if any(m.code for m in self.methods):
             self.cp.add_utf8("Code")
+
+        # Pre-add "Signature" attribute name and values
+        has_signature = (
+            self.signature or
+            any(m.signature for m in self.methods) or
+            any(f.signature for f in self.fields)
+        )
+        if has_signature:
+            self.cp.add_utf8("Signature")
+        if self.signature:
+            self.cp.add_utf8(self.signature)
+        for method in self.methods:
+            if method.signature:
+                self.cp.add_utf8(method.signature)
+        for fld in self.fields:
+            if fld.signature:
+                self.cp.add_utf8(fld.signature)
+
+        # Pre-add "RuntimeVisibleAnnotations" attribute name and annotation types
+        all_annotations = list(self.annotations)
+        for method in self.methods:
+            all_annotations.extend(method.annotations)
+        for fld in self.fields:
+            all_annotations.extend(fld.annotations)
+        if all_annotations:
+            self.cp.add_utf8("RuntimeVisibleAnnotations")
+            for ann in all_annotations:
+                self.cp.add_utf8(ann.type_descriptor)
+
+        # Pre-add "Exceptions" attribute name and exception class names
+        has_exceptions = any(m.exceptions for m in self.methods)
+        if has_exceptions:
+            self.cp.add_utf8("Exceptions")
+            for method in self.methods:
+                for exc in method.exceptions:
+                    self.cp.add_class(exc)
 
         # Magic number
         out.extend(struct.pack(">I", self.MAGIC))
@@ -492,8 +650,17 @@ class ClassFile:
         for method in self.methods:
             method.write(self.cp, out)
 
-        # Attributes
-        out.extend(struct.pack(">H", 0))
+        # Class attributes
+        attr_count = 0
+        if self.signature:
+            attr_count += 1
+        if self.annotations:
+            attr_count += 1
+        out.extend(struct.pack(">H", attr_count))
+        if self.signature:
+            _write_signature_attribute(self.cp, out, self.signature)
+        if self.annotations:
+            write_annotations_attribute(self.cp, out, "RuntimeVisibleAnnotations", self.annotations)
 
         return bytes(out)
 
@@ -1022,6 +1189,16 @@ class BytecodeBuilder:
         idx = self.cp.add_methodref(class_name, method_name, descriptor)
         self._emit(Opcode.INVOKESTATIC)
         self.code.extend(struct.pack(">H", idx))
+        self._pop(arg_size)
+        self._push(ret_size)
+
+    def invokeinterface(self, class_name: str, method_name: str, descriptor: str,
+                        arg_size: int, ret_size: int):
+        idx = self.cp.add_interface_methodref(class_name, method_name, descriptor)
+        self._emit(Opcode.INVOKEINTERFACE)
+        self.code.extend(struct.pack(">H", idx))
+        self.code.append(arg_size)  # count (includes 'this')
+        self.code.append(0)  # reserved, must be zero
         self._pop(arg_size)
         self._push(ret_size)
 

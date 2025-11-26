@@ -531,7 +531,12 @@ class Java8Transformer(Transformer):
         return ast.PrimitiveType(name=name or "int", annotations=tuple(annotations))
 
     def primitive_type_name(self, items):
-        return str(items[0]) if items else "int"
+        for item in items:
+            if hasattr(item, 'type') and item.type in {'BYTE', 'SHORT', 'INT', 'LONG', 'CHAR', 'FLOAT', 'DOUBLE', 'BOOLEAN'}:
+                return str(item)
+            elif isinstance(item, str):
+                return item
+        return "int"
 
     def reference_type(self, items):
         for item in items:
@@ -998,6 +1003,9 @@ class Java8Transformer(Transformer):
         return None
 
     def for_update(self, items):
+        for item in items:
+            if isinstance(item, tuple):
+                return item
         return self.statement_expression_list(items)
 
     def statement_expression_list(self, items):
@@ -1435,10 +1443,20 @@ class Java8Transformer(Transformer):
         return self._binary_expression(items, {"*", "/", "%"})
 
     def unary_expression(self, items):
+        op = None
+        expr = None
+
         for item in items:
             if isinstance(item, ast.Expression):
-                return item
-        return None
+                expr = item
+            elif hasattr(item, 'type') and item.type in {'PLUS', 'MINUS'}:
+                op = str(item)
+            elif item in {'+', '-'}:
+                op = item
+
+        if op and expr:
+            return ast.UnaryExpression(operator=op, operand=expr, prefix=True)
+        return expr
 
     def pre_increment_expression(self, items):
         for item in items:
@@ -1459,6 +1477,8 @@ class Java8Transformer(Transformer):
         for item in items:
             if isinstance(item, ast.Expression):
                 expr = item
+            elif hasattr(item, 'type') and item.type in {'BANG', 'TILDE'}:
+                op = str(item)
             elif item in {"~", "!"}:
                 op = item
 

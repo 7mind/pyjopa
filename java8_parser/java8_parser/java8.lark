@@ -127,7 +127,7 @@ type: primitive_type
 
 primitive_type: annotation* primitive_type_name
 
-primitive_type_name: "byte" | "short" | "int" | "long" | "char" | "float" | "double" | "boolean"
+primitive_type_name: BYTE | SHORT | INT | LONG | CHAR | FLOAT | DOUBLE | BOOLEAN
 
 reference_type: class_type
               | array_type
@@ -442,8 +442,8 @@ pre_increment_expression: "++" unary_expression
 pre_decrement_expression: "--" unary_expression
 
 unary_expression_not_plus_minus: postfix_expression
-                               | "~" unary_expression
-                               | "!" unary_expression
+                               | TILDE unary_expression
+                               | BANG unary_expression
                                | cast_expression
 
 postfix_expression: primary
@@ -601,6 +601,10 @@ GE: ">="
 EQ: "=="
 NE: "!="
 
+// Unary operators
+BANG: "!"
+TILDE: "~"
+
 // ==================== MODIFIER KEYWORDS ====================
 
 PUBLIC: "public"
@@ -615,6 +619,17 @@ TRANSIENT: "transient"
 VOLATILE: "volatile"
 STRICTFP: "strictfp"
 DEFAULT: "default"
+
+// ==================== PRIMITIVE TYPE KEYWORDS ====================
+
+BYTE: "byte"
+SHORT: "short"
+INT: "int"
+LONG: "long"
+CHAR: "char"
+FLOAT: "float"
+DOUBLE: "double"
+BOOLEAN: "boolean"
 
 // ==================== WHITESPACE AND COMMENTS ====================
 
