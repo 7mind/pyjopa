@@ -397,6 +397,544 @@ public class MultiReturn {
 ''',
         expected_output="1\n-1\n0\n"
     ),
+
+    # ==================== CONTROL FLOW ====================
+
+    # Do-while loop
+    TestCase(
+        name="DoWhile",
+        source='''
+public class DoWhile {
+    public static void main(String[] args) {
+        int i = 0;
+        do {
+            System.out.println(i);
+            i++;
+        } while (i < 3);
+    }
+}
+''',
+        expected_output="0\n1\n2\n"
+    ),
+
+    # Switch statement
+    TestCase(
+        name="SwitchCase",
+        source='''
+public class SwitchCase {
+    public static void main(String[] args) {
+        int x = 2;
+        switch (x) {
+            case 1:
+                System.out.println("one");
+                break;
+            case 2:
+                System.out.println("two");
+                break;
+            case 3:
+                System.out.println("three");
+                break;
+            default:
+                System.out.println("other");
+        }
+    }
+}
+''',
+        expected_output="two\n"
+    ),
+
+    # Break and continue
+    TestCase(
+        name="BreakContinue",
+        source='''
+public class BreakContinue {
+    public static void main(String[] args) {
+        for (int i = 0; i < 10; i++) {
+            if (i == 3) {
+                continue;
+            }
+            if (i == 6) {
+                break;
+            }
+            System.out.println(i);
+        }
+    }
+}
+''',
+        expected_output="0\n1\n2\n4\n5\n"
+    ),
+
+    # Else-if chain
+    TestCase(
+        name="ElseIf",
+        source='''
+public class ElseIf {
+    public static void main(String[] args) {
+        int x = 5;
+        if (x < 0) {
+            System.out.println("negative");
+        } else if (x == 0) {
+            System.out.println("zero");
+        } else if (x < 10) {
+            System.out.println("small");
+        } else {
+            System.out.println("large");
+        }
+    }
+}
+''',
+        expected_output="small\n"
+    ),
+
+    # ==================== OPERATORS ====================
+
+    # Compound assignment operators
+    TestCase(
+        name="CompoundAssign",
+        source='''
+public class CompoundAssign {
+    public static void main(String[] args) {
+        int a = 10;
+        a += 5;
+        System.out.println(a);
+        a -= 3;
+        System.out.println(a);
+        a *= 2;
+        System.out.println(a);
+        a /= 4;
+        System.out.println(a);
+        a %= 3;
+        System.out.println(a);
+    }
+}
+''',
+        expected_output="15\n12\n24\n6\n0\n"
+    ),
+
+    # Bitwise operators
+    TestCase(
+        name="BitwiseOps",
+        source='''
+public class BitwiseOps {
+    public static void main(String[] args) {
+        int a = 5;
+        int b = 3;
+        System.out.println(a & b);
+        System.out.println(a | b);
+        System.out.println(a ^ b);
+        System.out.println(~a);
+        System.out.println(a << 1);
+        System.out.println(a >> 1);
+    }
+}
+''',
+        expected_output="1\n7\n6\n-6\n10\n2\n"
+    ),
+
+    # Logical operators with short-circuit
+    TestCase(
+        name="LogicalOps",
+        source='''
+public class LogicalOps {
+    public static void main(String[] args) {
+        boolean t = true;
+        boolean f = false;
+        if (t && t) {
+            System.out.println("and1");
+        }
+        if (t && f) {
+            System.out.println("and2");
+        }
+        if (f || t) {
+            System.out.println("or1");
+        }
+        if (f || f) {
+            System.out.println("or2");
+        }
+    }
+}
+''',
+        expected_output="and1\nor1\n"
+    ),
+
+    # Ternary operator
+    TestCase(
+        name="Ternary",
+        source='''
+public class Ternary {
+    public static void main(String[] args) {
+        int x = 5;
+        int y = x > 3 ? 10 : 20;
+        System.out.println(y);
+        int z = x < 3 ? 10 : 20;
+        System.out.println(z);
+    }
+}
+''',
+        expected_output="10\n20\n"
+    ),
+
+    # Pre-increment and pre-decrement
+    TestCase(
+        name="PreIncDec",
+        source='''
+public class PreIncDec {
+    public static void main(String[] args) {
+        int a = 5;
+        System.out.println(++a);
+        System.out.println(a);
+        System.out.println(--a);
+        System.out.println(a);
+    }
+}
+''',
+        expected_output="6\n6\n5\n5\n"
+    ),
+
+    # String concatenation
+    TestCase(
+        name="StringConcat",
+        source='''
+public class StringConcat {
+    public static void main(String[] args) {
+        String s = "Hello" + " " + "World";
+        System.out.println(s);
+        String t = "Value: " + 42;
+        System.out.println(t);
+    }
+}
+''',
+        expected_output="Hello World\nValue: 42\n"
+    ),
+
+    # ==================== TYPES ====================
+
+    # Float and double
+    TestCase(
+        name="FloatDouble",
+        source='''
+public class FloatDouble {
+    public static void main(String[] args) {
+        float f = 3.14f;
+        double d = 2.718;
+        System.out.println(f > 3.0f);
+        System.out.println(d < 3.0);
+    }
+}
+''',
+        expected_output="true\ntrue\n"
+    ),
+
+    # Char type
+    TestCase(
+        name="CharType",
+        source='''
+public class CharType {
+    public static void main(String[] args) {
+        char c = 'A';
+        System.out.println(c);
+        char d = 66;
+        System.out.println(d);
+    }
+}
+''',
+        expected_output="A\nB\n"
+    ),
+
+    # Arrays
+    TestCase(
+        name="Arrays",
+        source='''
+public class Arrays {
+    public static void main(String[] args) {
+        int[] arr = new int[3];
+        arr[0] = 10;
+        arr[1] = 20;
+        arr[2] = 30;
+        System.out.println(arr[0]);
+        System.out.println(arr[1]);
+        System.out.println(arr[2]);
+        System.out.println(arr.length);
+    }
+}
+''',
+        expected_output="10\n20\n30\n3\n"
+    ),
+
+    # Array initializer
+    TestCase(
+        name="ArrayInit",
+        source='''
+public class ArrayInit {
+    public static void main(String[] args) {
+        int[] arr = {1, 2, 3, 4, 5};
+        System.out.println(arr[0]);
+        System.out.println(arr[4]);
+        System.out.println(arr.length);
+    }
+}
+''',
+        expected_output="1\n5\n5\n"
+    ),
+
+    # Enhanced for loop (for-each)
+    TestCase(
+        name="ForEach",
+        source='''
+public class ForEach {
+    public static void main(String[] args) {
+        int[] arr = {1, 2, 3};
+        for (int x : arr) {
+            System.out.println(x);
+        }
+    }
+}
+''',
+        expected_output="1\n2\n3\n"
+    ),
+
+    # ==================== OOP ====================
+
+    # Instance fields and methods
+    TestCase(
+        name="InstanceMembers",
+        source='''
+public class InstanceMembers {
+    int value;
+
+    int getValue() {
+        return value;
+    }
+
+    void setValue(int v) {
+        value = v;
+    }
+
+    public static void main(String[] args) {
+        InstanceMembers obj = new InstanceMembers();
+        obj.setValue(42);
+        System.out.println(obj.getValue());
+        System.out.println(obj.value);
+    }
+}
+''',
+        expected_output="42\n42\n"
+    ),
+
+    # Constructors
+    TestCase(
+        name="Constructor",
+        source='''
+public class Constructor {
+    int x;
+    int y;
+
+    public Constructor(int a, int b) {
+        x = a;
+        y = b;
+    }
+
+    public static void main(String[] args) {
+        Constructor c = new Constructor(10, 20);
+        System.out.println(c.x);
+        System.out.println(c.y);
+    }
+}
+''',
+        expected_output="10\n20\n"
+    ),
+
+    # This keyword
+    TestCase(
+        name="ThisKeyword",
+        source='''
+public class ThisKeyword {
+    int x;
+
+    void setX(int x) {
+        this.x = x;
+    }
+
+    int getX() {
+        return this.x;
+    }
+
+    public static void main(String[] args) {
+        ThisKeyword obj = new ThisKeyword();
+        obj.setX(100);
+        System.out.println(obj.getX());
+    }
+}
+''',
+        expected_output="100\n"
+    ),
+
+    # Static fields
+    TestCase(
+        name="StaticFields",
+        source='''
+public class StaticFields {
+    static int count = 0;
+
+    static void increment() {
+        count++;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(count);
+        increment();
+        System.out.println(count);
+        increment();
+        System.out.println(count);
+    }
+}
+''',
+        expected_output="0\n1\n2\n"
+    ),
+
+    # Null handling
+    TestCase(
+        name="NullHandling",
+        source='''
+public class NullHandling {
+    public static void main(String[] args) {
+        String s = null;
+        if (s == null) {
+            System.out.println("is null");
+        }
+        s = "hello";
+        if (s != null) {
+            System.out.println("not null");
+        }
+    }
+}
+''',
+        expected_output="is null\nnot null\n"
+    ),
+
+    # instanceof operator
+    TestCase(
+        name="InstanceOf",
+        source='''
+public class InstanceOf {
+    public static void main(String[] args) {
+        String s = "hello";
+        if (s instanceof String) {
+            System.out.println("is String");
+        }
+        Object o = s;
+        if (o instanceof String) {
+            System.out.println("also String");
+        }
+    }
+}
+''',
+        expected_output="is String\nalso String\n"
+    ),
+
+    # ==================== EXCEPTIONS ====================
+
+    # Try-catch
+    TestCase(
+        name="TryCatch",
+        source='''
+public class TryCatch {
+    public static void main(String[] args) {
+        try {
+            int x = 10 / 0;
+            System.out.println("no exception");
+        } catch (ArithmeticException e) {
+            System.out.println("caught");
+        }
+        System.out.println("done");
+    }
+}
+''',
+        expected_output="caught\ndone\n"
+    ),
+
+    # Try-catch-finally
+    TestCase(
+        name="TryFinally",
+        source='''
+public class TryFinally {
+    public static void main(String[] args) {
+        try {
+            System.out.println("try");
+        } finally {
+            System.out.println("finally");
+        }
+        System.out.println("done");
+    }
+}
+''',
+        expected_output="try\nfinally\ndone\n"
+    ),
+
+    # Throw statement
+    TestCase(
+        name="ThrowStmt",
+        source='''
+public class ThrowStmt {
+    static void test(int x) {
+        if (x < 0) {
+            throw new IllegalArgumentException();
+        }
+        System.out.println("ok");
+    }
+
+    public static void main(String[] args) {
+        try {
+            test(5);
+            test(-1);
+        } catch (IllegalArgumentException e) {
+            System.out.println("caught");
+        }
+    }
+}
+''',
+        expected_output="ok\ncaught\n"
+    ),
+
+    # ==================== JAVA 5 FEATURES ====================
+
+    # Autoboxing
+    TestCase(
+        name="Autoboxing",
+        source='''
+public class Autoboxing {
+    public static void main(String[] args) {
+        Integer i = 42;
+        int x = i;
+        System.out.println(x);
+        System.out.println(i.intValue());
+    }
+}
+''',
+        expected_output="42\n42\n"
+    ),
+
+    # Varargs
+    TestCase(
+        name="Varargs",
+        source='''
+public class Varargs {
+    static int sum(int... nums) {
+        int total = 0;
+        for (int n : nums) {
+            total += n;
+        }
+        return total;
+    }
+
+    public static void main(String[] args) {
+        System.out.println(sum(1, 2, 3));
+        System.out.println(sum(10, 20));
+    }
+}
+''',
+        expected_output="6\n30\n"
+    ),
 ]
 
 

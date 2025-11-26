@@ -385,26 +385,26 @@ left_hand_side: expression_name
               | array_access
               | "(" left_hand_side ")"
 
-assignment_operator: "=" | "+=" | "-=" | "*=" | "/=" | "%=" | "&=" | "|=" | "^=" | "<<=" | ">>=" | ">>>="
+assignment_operator: ASSIGN | PLUS_ASSIGN | MINUS_ASSIGN | STAR_ASSIGN | SLASH_ASSIGN | PERCENT_ASSIGN | AMP_ASSIGN | PIPE_ASSIGN | CARET_ASSIGN | LSHIFT_ASSIGN | RSHIFT_ASSIGN | URSHIFT_ASSIGN
 
 conditional_expression: conditional_or_expression
                       | conditional_or_expression "?" expression ":" conditional_expression
                       | conditional_or_expression "?" expression ":" lambda_expression
 
 conditional_or_expression: conditional_and_expression
-                         | conditional_or_expression "||" conditional_and_expression
+                         | conditional_or_expression PIPEPIPE conditional_and_expression
 
 conditional_and_expression: inclusive_or_expression
-                          | conditional_and_expression "&&" inclusive_or_expression
+                          | conditional_and_expression AMPAMP inclusive_or_expression
 
 inclusive_or_expression: exclusive_or_expression
-                       | inclusive_or_expression "|" exclusive_or_expression
+                       | inclusive_or_expression PIPE exclusive_or_expression
 
 exclusive_or_expression: and_expression
-                       | exclusive_or_expression "^" and_expression
+                       | exclusive_or_expression CARET and_expression
 
 and_expression: equality_expression
-              | and_expression "&" equality_expression
+              | and_expression AMP equality_expression
 
 equality_expression: relational_expression
                    | equality_expression EQ relational_expression
@@ -601,9 +601,32 @@ GE: ">="
 EQ: "=="
 NE: "!="
 
+// Bitwise operators
+AMP: "&"
+PIPE: "|"
+CARET: "^"
+
+// Logical operators
+AMPAMP: "&&"
+PIPEPIPE: "||"
+
 // Unary operators
 BANG: "!"
 TILDE: "~"
+
+// Assignment operators
+ASSIGN: "="
+PLUS_ASSIGN: "+="
+MINUS_ASSIGN: "-="
+STAR_ASSIGN: "*="
+SLASH_ASSIGN: "/="
+PERCENT_ASSIGN: "%="
+AMP_ASSIGN: "&="
+PIPE_ASSIGN: "|="
+CARET_ASSIGN: "^="
+LSHIFT_ASSIGN: "<<="
+RSHIFT_ASSIGN: ">>="
+URSHIFT_ASSIGN: ">>>="
 
 // ==================== MODIFIER KEYWORDS ====================
 

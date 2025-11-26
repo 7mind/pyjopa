@@ -1323,12 +1323,20 @@ class Java8Transformer(Transformer):
         operator = "="
         value = None
 
+        assignment_ops = {
+            'ASSIGN', 'PLUS_ASSIGN', 'MINUS_ASSIGN', 'STAR_ASSIGN',
+            'SLASH_ASSIGN', 'PERCENT_ASSIGN', 'AMP_ASSIGN', 'PIPE_ASSIGN',
+            'CARET_ASSIGN', 'LSHIFT_ASSIGN', 'RSHIFT_ASSIGN', 'URSHIFT_ASSIGN'
+        }
+
         for item in items:
             if isinstance(item, ast.Expression):
                 if target is None:
                     target = item
                 else:
                     value = item
+            elif hasattr(item, 'type') and item.type in assignment_ops:
+                operator = str(item)
             elif isinstance(item, str) and "=" in item:
                 operator = item
 
@@ -1345,6 +1353,9 @@ class Java8Transformer(Transformer):
         return None
 
     def assignment_operator(self, items):
+        for item in items:
+            if hasattr(item, 'type'):
+                return str(item)
         return str(items[0]) if items else "="
 
     def conditional_expression(self, items):

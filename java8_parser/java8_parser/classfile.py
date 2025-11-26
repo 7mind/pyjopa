@@ -1115,6 +1115,38 @@ class BytecodeBuilder:
         self._emit_u2(0)
         self._pop(2)
 
+    def if_acmpeq(self, label: str):
+        self._emit(Opcode.IF_ACMPEQ)
+        self._forward_refs.append((label, self.position(), 2))
+        self._emit_u2(0)
+        self._pop(2)
+
+    def if_acmpne(self, label: str):
+        self._emit(Opcode.IF_ACMPNE)
+        self._forward_refs.append((label, self.position(), 2))
+        self._emit_u2(0)
+        self._pop(2)
+
+    def ifnull(self, label: str):
+        self._emit(Opcode.IFNULL)
+        self._forward_refs.append((label, self.position(), 2))
+        self._emit_u2(0)
+        self._pop()
+
+    def ifnonnull(self, label: str):
+        self._emit(Opcode.IFNONNULL)
+        self._forward_refs.append((label, self.position(), 2))
+        self._emit_u2(0)
+        self._pop()
+
+    def instanceof_(self, class_name: str):
+        """Check if object is an instance of a class. Pops reference, pushes int (0 or 1)."""
+        idx = self.cp.add_class(class_name)
+        self._emit(Opcode.INSTANCEOF)
+        self.code.extend(struct.pack(">H", idx))
+        self._pop()
+        self._push()
+
     def goto(self, label: str):
         self._emit(Opcode.GOTO)
         self._forward_refs.append((label, self.position(), 2))

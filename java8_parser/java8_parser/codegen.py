@@ -892,6 +892,40 @@ class CodeGenerator:
         if isinstance(expr, ast.BinaryExpression):
             op = expr.operator
             if op in ("==", "!=", "<", ">=", ">", "<="):
+                # Check for null comparison
+                is_left_null = isinstance(expr.left, ast.Literal) and expr.left.kind == "null"
+                is_right_null = isinstance(expr.right, ast.Literal) and expr.right.kind == "null"
+
+                if is_right_null and op in ("==", "!="):
+                    # expr == null or expr != null
+                    self.compile_expression(expr.left, ctx)
+                    if jump_if_true:
+                        if op == "==":
+                            builder.ifnull(target)
+                        else:
+                            builder.ifnonnull(target)
+                    else:
+                        if op == "==":
+                            builder.ifnonnull(target)
+                        else:
+                            builder.ifnull(target)
+                    return
+
+                if is_left_null and op in ("==", "!="):
+                    # null == expr or null != expr
+                    self.compile_expression(expr.right, ctx)
+                    if jump_if_true:
+                        if op == "==":
+                            builder.ifnull(target)
+                        else:
+                            builder.ifnonnull(target)
+                    else:
+                        if op == "==":
+                            builder.ifnonnull(target)
+                        else:
+                            builder.ifnull(target)
+                    return
+
                 left_type = self.compile_expression(expr.left, ctx)
                 right_type = self.compile_expression(expr.right, ctx)
 
@@ -923,6 +957,82 @@ class CodeGenerator:
                             builder.if_icmple(target)
                         elif op == "<=":
                             builder.if_icmpgt(target)
+                    return
+
+                # Float comparison
+                if left_type == FLOAT or right_type == FLOAT:
+                    builder.fcmpg()
+                    if jump_if_true:
+                        if op == "==":
+                            builder.ifeq(target)
+                        elif op == "!=":
+                            builder.ifne(target)
+                        elif op == "<":
+                            builder.iflt(target)
+                        elif op == ">=":
+                            builder.ifge(target)
+                        elif op == ">":
+                            builder.ifgt(target)
+                        elif op == "<=":
+                            builder.ifle(target)
+                    else:
+                        if op == "==":
+                            builder.ifne(target)
+                        elif op == "!=":
+                            builder.ifeq(target)
+                        elif op == "<":
+                            builder.ifge(target)
+                        elif op == ">=":
+                            builder.iflt(target)
+                        elif op == ">":
+                            builder.ifle(target)
+                        elif op == "<=":
+                            builder.ifgt(target)
+                    return
+
+                # Double comparison
+                if left_type == DOUBLE or right_type == DOUBLE:
+                    builder.dcmpg()
+                    if jump_if_true:
+                        if op == "==":
+                            builder.ifeq(target)
+                        elif op == "!=":
+                            builder.ifne(target)
+                        elif op == "<":
+                            builder.iflt(target)
+                        elif op == ">=":
+                            builder.ifge(target)
+                        elif op == ">":
+                            builder.ifgt(target)
+                        elif op == "<=":
+                            builder.ifle(target)
+                    else:
+                        if op == "==":
+                            builder.ifne(target)
+                        elif op == "!=":
+                            builder.ifeq(target)
+                        elif op == "<":
+                            builder.ifge(target)
+                        elif op == ">=":
+                            builder.iflt(target)
+                        elif op == ">":
+                            builder.ifle(target)
+                        elif op == "<=":
+                            builder.ifgt(target)
+                    return
+
+                # Reference comparison
+                if left_type.is_reference and right_type.is_reference and op in ("==", "!="):
+                    if jump_if_true:
+                        if op == "==":
+                            builder.if_acmpeq(target)
+                        else:
+                            builder.if_acmpne(target)
+                    else:
+                        if op == "==":
+                            builder.if_acmpne(target)
+                        else:
+                            builder.if_acmpeq(target)
                     return
 
             elif op == "&&":
@@ -1240,6 +1350,34 @@ class CodeGenerator:
                     builder.if_icmpgt(true_label)
                 elif op == "<=":
                     builder.if_icmple(true_label)
+            elif left_type == FLOAT or right_type == FLOAT:
+                builder.fcmpg()
+                if op == "==":
+                    builder.ifeq(true_label)
+                elif op == "!=":
+                    builder.ifne(true_label)
+                elif op == "<":
+                    builder.iflt(true_label)
+                elif op == ">=":
+                    builder.ifge(true_label)
+                elif op == ">":
+                    builder.ifgt(true_label)
+                elif op == "<=":
+                    builder.ifle(true_label)
+            elif left_type == DOUBLE or right_type == DOUBLE:
+                builder.dcmpg()
+                if op == "==":
+                    builder.ifeq(true_label)
+                elif op == "!=":
+                    builder.ifne(true_label)
+                elif op == "<":
+                    builder.iflt(true_label)
+                elif op == ">=":
+                    builder.ifge(true_label)
+                elif op == ">":
+                    builder.ifgt(true_label)
+                elif op == "<=":
+                    builder.ifle(true_label)
 
             builder.iconst(0)
             builder.goto(end_label)
