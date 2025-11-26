@@ -676,10 +676,11 @@ class Java8Transformer(Transformer):
         for item in items:
             if isinstance(item, ast.Annotation):
                 return ast.Modifier(keyword=None, annotation=item)
-            if isinstance(item, str):
-                return ast.Modifier(keyword=item, annotation=None)
+            # Check Token before str since Token is a str subclass
             if isinstance(item, Token):
                 return ast.Modifier(keyword=str(item), annotation=None)
+            if isinstance(item, str):
+                return ast.Modifier(keyword=item, annotation=None)
         return None
 
     def annotation(self, items):
@@ -1376,10 +1377,11 @@ class Java8Transformer(Transformer):
                 elif pending_op:
                     result = ast.BinaryExpression(left=result, operator=pending_op, right=item)
                     pending_op = None
+            elif isinstance(item, Token) and str(item) in operators:
+                # Check Token before str since Token is a str subclass
+                pending_op = str(item)
             elif isinstance(item, str) and item in operators:
                 pending_op = item
-            elif isinstance(item, Token) and str(item) in operators:
-                pending_op = str(item)
 
         return result
 
@@ -1415,10 +1417,11 @@ class Java8Transformer(Transformer):
             elif isinstance(item, ast.Type) and pending_op == "instanceof":
                 result = ast.InstanceOfExpression(expression=result, type=item)
                 pending_op = None
-            elif isinstance(item, str) and item in {"<", ">", "<=", ">=", "instanceof"}:
-                pending_op = item
+            # Check Token before str since Token is a str subclass
             elif isinstance(item, Token) and str(item) in {"<", ">", "<=", ">="}:
                 pending_op = str(item)
+            elif isinstance(item, str) and item in {"<", ">", "<=", ">=", "instanceof"}:
+                pending_op = item
 
         return result
 
@@ -1643,6 +1646,11 @@ class Java8Transformer(Transformer):
         for item in items:
             if isinstance(item, ast.Expression) and method is None:
                 target = item
+            elif isinstance(item, ast.ClassType) and method is None:
+                # Convert type name to QualifiedName for use as target
+                # e.g., System.out becomes QualifiedName(("System", "out"))
+                parts = tuple(item.name.split("."))
+                target = ast.QualifiedName(parts=parts)
             elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
                 type_args = item
             elif isinstance(item, Token) and item.type == "IDENTIFIER":

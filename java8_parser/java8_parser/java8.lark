@@ -168,18 +168,18 @@ wildcard_bounds: "extends" reference_type
 // ==================== MODIFIERS AND ANNOTATIONS ====================
 
 modifier: annotation
-        | "public"
-        | "protected"
-        | "private"
-        | "static"
-        | "abstract"
-        | "final"
-        | "native"
-        | "synchronized"
-        | "transient"
-        | "volatile"
-        | "strictfp"
-        | "default"
+        | PUBLIC
+        | PROTECTED
+        | PRIVATE
+        | STATIC
+        | ABSTRACT
+        | FINAL
+        | NATIVE
+        | SYNCHRONIZED
+        | TRANSIENT
+        | VOLATILE
+        | STRICTFP
+        | DEFAULT
 
 annotation: "@" qualified_name ("(" annotation_arguments? ")")?
 
@@ -407,34 +407,34 @@ and_expression: equality_expression
               | and_expression "&" equality_expression
 
 equality_expression: relational_expression
-                   | equality_expression "==" relational_expression
-                   | equality_expression "!=" relational_expression
+                   | equality_expression EQ relational_expression
+                   | equality_expression NE relational_expression
 
 relational_expression: shift_expression
-                     | relational_expression "<" shift_expression
-                     | relational_expression ">" shift_expression
-                     | relational_expression "<=" shift_expression
-                     | relational_expression ">=" shift_expression
+                     | relational_expression LT shift_expression
+                     | relational_expression GT shift_expression
+                     | relational_expression LE shift_expression
+                     | relational_expression GE shift_expression
                      | relational_expression "instanceof" reference_type
 
 shift_expression: additive_expression
-                | shift_expression "<<" additive_expression
-                | shift_expression ">>" additive_expression
-                | shift_expression ">>>" additive_expression
+                | shift_expression LSHIFT additive_expression
+                | shift_expression RSHIFT additive_expression
+                | shift_expression URSHIFT additive_expression
 
 additive_expression: multiplicative_expression
-                   | additive_expression "+" multiplicative_expression
-                   | additive_expression "-" multiplicative_expression
+                   | additive_expression PLUS multiplicative_expression
+                   | additive_expression MINUS multiplicative_expression
 
 multiplicative_expression: unary_expression
-                         | multiplicative_expression "*" unary_expression
-                         | multiplicative_expression "/" unary_expression
-                         | multiplicative_expression "%" unary_expression
+                         | multiplicative_expression STAR unary_expression
+                         | multiplicative_expression SLASH unary_expression
+                         | multiplicative_expression PERCENT unary_expression
 
 unary_expression: pre_increment_expression
                 | pre_decrement_expression
-                | "+" unary_expression
-                | "-" unary_expression
+                | PLUS unary_expression
+                | MINUS unary_expression
                 | unary_expression_not_plus_minus
 
 pre_increment_expression: "++" unary_expression
@@ -581,6 +581,40 @@ CHARACTER_LITERAL: /'([^'\\\n]|\\[btnfr"'\\]|\\u[0-9a-fA-F]{4}|\\[0-3]?[0-7]{1,2
 STRING_LITERAL: /"([^"\\\n]|\\[btnfr"'\\]|\\u[0-9a-fA-F]{4}|\\[0-3]?[0-7]{1,2})*"/
 
 NULL_LITERAL: "null"
+
+// ==================== OPERATOR TERMINALS ====================
+
+PLUS: "+"
+MINUS: "-"
+// STAR is already defined above for imports
+SLASH: "/"
+PERCENT: "%"
+LSHIFT: "<<"
+RSHIFT: ">>"
+URSHIFT: ">>>"
+
+// Comparison operators
+LT: "<"
+GT: ">"
+LE: "<="
+GE: ">="
+EQ: "=="
+NE: "!="
+
+// ==================== MODIFIER KEYWORDS ====================
+
+PUBLIC: "public"
+PROTECTED: "protected"
+PRIVATE: "private"
+// STATIC is already defined above for imports
+ABSTRACT: "abstract"
+FINAL: "final"
+NATIVE: "native"
+SYNCHRONIZED: "synchronized"
+TRANSIENT: "transient"
+VOLATILE: "volatile"
+STRICTFP: "strictfp"
+DEFAULT: "default"
 
 // ==================== WHITESPACE AND COMMENTS ====================
 
