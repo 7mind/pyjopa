@@ -9,7 +9,9 @@
 
 start: compilation_unit
 
-compilation_unit: package_declaration? import_declaration* type_declaration*
+compilation_unit: package_declaration? import_or_semicolon* type_declaration*
+
+import_or_semicolon: import_declaration | ";"
 
 package_declaration: annotation* "package" qualified_name ";"
 
@@ -564,6 +566,7 @@ INTEGER_LITERAL: /0[xX][0-9a-fA-F]([0-9a-fA-F_]*[0-9a-fA-F])?[lL]?/
                | /[0-9]([0-9_]*[0-9])?[lL]?/
 
 FLOATING_POINT_LITERAL: /[0-9]([0-9_]*[0-9])?\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?[fFdD]?/
+                      | /[0-9]([0-9_]*[0-9])?\.([eE][+-]?[0-9]([0-9_]*[0-9])?)?[fFdD]?/
                       | /\.[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)?[fFdD]?/
                       | /[0-9]([0-9_]*[0-9])?([eE][+-]?[0-9]([0-9_]*[0-9])?)[fFdD]?/
                       | /[0-9]([0-9_]*[0-9])?[fFdD]/

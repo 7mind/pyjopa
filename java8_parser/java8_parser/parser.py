@@ -85,6 +85,12 @@ class Java8Transformer(Transformer):
             types=tuple(types)
         )
 
+    def import_or_semicolon(self, items):
+        for item in items:
+            if isinstance(item, ast.ImportDeclaration):
+                return item
+        return None
+
     def package_declaration(self, items):
         annotations = []
         name = None
