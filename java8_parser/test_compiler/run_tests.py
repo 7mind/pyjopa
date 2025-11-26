@@ -18,9 +18,9 @@ from dataclasses import dataclass
 # Add parent to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from java8_parser.parser import Java8Parser
-from java8_parser.codegen import CodeGenerator
-from java8_parser.classreader import ClassPath
+from pyjopa.parser import Java8Parser
+from pyjopa.codegen import CodeGenerator
+from pyjopa.classreader import ClassPath
 
 
 @dataclass
@@ -33,6 +33,23 @@ class TestCase:
     def __post_init__(self):
         if self.main_class is None:
             self.main_class = self.name
+
+
+@dataclass
+class MultiFileTestCase:
+    """Test case with multiple source files."""
+    name: str
+    sources: dict[str, str]  # filename -> source
+    expected_output: str
+    main_class: str
+
+
+@dataclass
+class PackageInfoTestCase:
+    """Test case for package-info.java files."""
+    name: str
+    source: str  # package-info.java content
+    expected_annotations: list[str]  # list of expected annotation descriptors
 
 
 JAVA6_TESTS = [
@@ -937,6 +954,42 @@ public class Varargs {
     ),
 ]
 
+MULTI_FILE_TESTS = [
+    # Multi-file dependency test (files ordered so dependencies compile first)
+    MultiFileTestCase(
+        name="MultiFileDep",
+        sources={
+            "1_Helper.java": '''
+public class Helper {
+    public static int add(int a, int b) {
+        return a + b;
+    }
+}
+''',
+            "2_MultiFileDep.java": '''
+public class MultiFileDep {
+    public static void main(String[] args) {
+        System.out.println(Helper.add(10, 20));
+    }
+}
+''',
+        },
+        expected_output="30\n",
+        main_class="MultiFileDep"
+    ),
+]
+
+PACKAGE_INFO_TESTS = [
+    PackageInfoTestCase(
+        name="PackageInfoDeprecated",
+        source='''
+@Deprecated
+package testpkg;
+''',
+        expected_annotations=["Ljava/lang/Deprecated;"]
+    ),
+]
+
 
 def run_test(test: TestCase, output_dir: Path, verbose: bool = False) -> tuple[bool, str]:
     """
@@ -1013,6 +1066,144 @@ def run_test(test: TestCase, output_dir: Path, verbose: bool = False) -> tuple[b
     return True, ""
 
 
+def run_multi_file_test(test: MultiFileTestCase, output_dir: Path, verbose: bool = False) -> tuple[bool, str]:
+    """
+    Run a multi-file test case.
+    Returns (success, error_message)
+    """
+    # Step 1: Write all source files
+    for filename, source in test.sources.items():
+        source_file = output_dir / filename
+        source_file.parent.mkdir(parents=True, exist_ok=True)
+        source_file.write_text(source.strip() + "\n")
+
+    # Step 2: Compile all files with our compiler
+    try:
+        parser = Java8Parser()
+        classpath = ClassPath()
+        classpath.add_rt_jar()
+        # Add output dir so we can find previously compiled classes
+        classpath.add_path(str(output_dir))
+
+        # Compile each source file (sorted so dependencies compile first)
+        for filename in sorted(test.sources.keys()):
+            source_file = output_dir / filename
+            ast = parser.parse_file(str(source_file))
+
+            # Use a fresh generator for each file but same classpath
+            gen = CodeGenerator(classpath)
+            results = gen.compile(ast)
+
+            for name, class_bytes in results.items():
+                out_file = output_dir / f"{name}.class"
+                out_file.parent.mkdir(parents=True, exist_ok=True)
+                out_file.write_bytes(class_bytes)
+
+        if verbose:
+            print(f"  Compiled {test.name}: {len(test.sources)} file(s)")
+
+    except Exception as e:
+        return False, f"Compilation failed: {e}"
+
+    # Step 3: Run with real JVM
+    try:
+        result = subprocess.run(
+            ["java", "-cp", str(output_dir), test.main_class],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return False, f"JVM execution failed (exit {result.returncode}):\nstdout: {result.stdout}\nstderr: {result.stderr}"
+
+        actual_output = result.stdout
+        if actual_output != test.expected_output:
+            return False, f"Output mismatch:\nExpected: {repr(test.expected_output)}\nActual: {repr(actual_output)}"
+
+        if verbose:
+            print(f"  JVM execution passed (verified bytecode)")
+
+    except subprocess.TimeoutExpired:
+        return False, "JVM execution timed out"
+    except Exception as e:
+        return False, f"JVM execution failed: {e}"
+
+    return True, ""
+
+
+def run_package_info_test(test: PackageInfoTestCase, output_dir: Path, verbose: bool = False) -> tuple[bool, str]:
+    """
+    Run a package-info test case.
+    Returns (success, error_message)
+    """
+    # Step 1: Write source file
+    source_file = output_dir / "package-info.java"
+    source_file.write_text(test.source.strip() + "\n")
+
+    # Step 2: Compile with our compiler
+    try:
+        parser = Java8Parser()
+        ast = parser.parse_file(str(source_file))
+
+        gen = CodeGenerator()
+        results = gen.compile(ast)
+
+        if not results:
+            return False, "No class files generated"
+
+        for name, class_bytes in results.items():
+            out_file = output_dir / f"{name}.class"
+            out_file.parent.mkdir(parents=True, exist_ok=True)
+            out_file.write_bytes(class_bytes)
+
+        if verbose:
+            print(f"  Compiled {test.name}: {len(results)} class(es)")
+
+    except Exception as e:
+        return False, f"Compilation failed: {e}"
+
+    # Step 3: Validate with javap and check for expected annotations
+    try:
+        # Find the package-info.class file
+        class_files = list(output_dir.rglob("package-info.class"))
+        if not class_files:
+            return False, "package-info.class not found"
+
+        result = subprocess.run(
+            ["javap", "-v", str(class_files[0])],
+            capture_output=True,
+            text=True,
+            timeout=10
+        )
+        if result.returncode != 0:
+            return False, f"javap validation failed: {result.stderr}"
+
+        javap_output = result.stdout
+
+        # Check for expected flags
+        if "ACC_INTERFACE" not in javap_output:
+            return False, "package-info.class missing ACC_INTERFACE flag"
+        if "ACC_ABSTRACT" not in javap_output:
+            return False, "package-info.class missing ACC_ABSTRACT flag"
+        if "ACC_SYNTHETIC" not in javap_output:
+            return False, "package-info.class missing ACC_SYNTHETIC flag"
+
+        # Check for expected annotations
+        for ann_desc in test.expected_annotations:
+            if ann_desc not in javap_output:
+                return False, f"Expected annotation {ann_desc} not found in bytecode"
+
+        if verbose:
+            print(f"  javap validation passed (annotations verified)")
+
+    except subprocess.TimeoutExpired:
+        return False, "javap timed out"
+    except Exception as e:
+        return False, f"javap failed: {e}"
+
+    return True, ""
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Run Java 6 compiler tests")
@@ -1021,15 +1212,17 @@ def main():
     parser.add_argument("--list", action="store_true", help="List all tests")
     args = parser.parse_args()
 
+    all_tests = JAVA6_TESTS + MULTI_FILE_TESTS + PACKAGE_INFO_TESTS
+
     if args.list:
         print("Available tests:")
-        for test in JAVA6_TESTS:
+        for test in all_tests:
             print(f"  {test.name}")
         return
 
-    tests_to_run = JAVA6_TESTS
+    tests_to_run = all_tests
     if args.test:
-        tests_to_run = [t for t in JAVA6_TESTS if t.name == args.test]
+        tests_to_run = [t for t in all_tests if t.name == args.test]
         if not tests_to_run:
             print(f"Test '{args.test}' not found")
             sys.exit(1)
@@ -1047,7 +1240,12 @@ def main():
             if args.verbose:
                 print(f"Testing {test.name}...")
 
-            success, error = run_test(test, output_dir, args.verbose)
+            if isinstance(test, MultiFileTestCase):
+                success, error = run_multi_file_test(test, output_dir, args.verbose)
+            elif isinstance(test, PackageInfoTestCase):
+                success, error = run_package_info_test(test, output_dir, args.verbose)
+            else:
+                success, error = run_test(test, output_dir, args.verbose)
 
             if success:
                 passed += 1

@@ -3,19 +3,28 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "java8-parser"
+name = "pyjopa"
 version = "0.1.0"
-description = "A complete Java 8 parser with immutable AST and JSON serialization"
+description = "Python Java Parser - A complete Java 8 parser and bytecode compiler"
 requires-python = ">=3.10"
 dependencies = [
     "lark>=1.0.0",
 ]
+
+[project.scripts]
+pyjopa = "pyjopa.cli:main"
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "pytest-xdist>=3.0.0",
 ]
+
+[tool.setuptools.packages.find]
+include = ["pyjopa*"]
+
+[tool.setuptools.package-data]
+pyjopa = ["*.lark"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -11,7 +11,7 @@ import os
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from java8_parser.parser import Java8Parser
+from pyjopa.parser import Java8Parser
 
 
 EXCLUDED_FILES = {

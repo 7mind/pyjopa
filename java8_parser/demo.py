@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Demo script showing the Java 8 parser in action."""
 
-from java8_parser import Java8Parser
+from pyjopa import Java8Parser
 import json
 
 SAMPLE_CODE = '''
