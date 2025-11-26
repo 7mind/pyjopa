@@ -1,0 +1,6 @@
+[submodule "jdk7u-langtools"]
+	path = jdk7u-langtools
+	url = https://github.com/openjdk-mirror/jdk7u-langtools.git
+[submodule "jdk8u_langtools"]
+	path = jdk8u_langtools
+	url = https://github.com/JetBrains/jdk8u_langtools.git
