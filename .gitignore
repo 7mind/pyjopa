@@ -1,2 +1,15 @@
-*.class
 
+*$py.class
+build/
+*.class
+compile_errors.txt
+.direnv/
+dist/
+*.egg-info/
+flake.lock
+parse_errors.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/
+result
+whitelist.txt
