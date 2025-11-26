@@ -84,6 +84,18 @@ PRIMITIVE_TYPES = {
     "double": DOUBLE,
 }
 
+PRIMITIVE_BY_DESCRIPTOR = {
+    "V": VOID,
+    "Z": BOOLEAN,
+    "B": BYTE,
+    "C": CHAR,
+    "S": SHORT,
+    "I": INT,
+    "J": LONG,
+    "F": FLOAT,
+    "D": DOUBLE,
+}
+
 
 @dataclass(frozen=True)
 class ClassJType(JType):

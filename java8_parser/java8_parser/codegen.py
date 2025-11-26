@@ -14,7 +14,7 @@ from .types import (
 )
 from .classfile import (
     ClassFile, MethodInfo, FieldInfo, CodeAttribute, BytecodeBuilder,
-    AccessFlags, AnnotationInfo,
+    AccessFlags, AnnotationInfo, ExceptionTableEntry,
 )
 from .classreader import ClassPath, ClassInfo as ReadClassInfo, MethodInfo as ReadMethodInfo, FieldInfo as ReadFieldInfo
 
@@ -33,6 +33,13 @@ class LocalVariable:
 
 
 @dataclass
+class LoopContext:
+    """Context for a loop (for break/continue)."""
+    break_label: str
+    continue_label: str
+
+
+@dataclass
 class MethodContext:
     """Context for compiling a method."""
     class_name: str
@@ -41,6 +48,26 @@ class MethodContext:
     builder: BytecodeBuilder
     locals: dict[str, LocalVariable] = field(default_factory=dict)
     next_slot: int = 0
+    loop_stack: list[LoopContext] = field(default_factory=list)
+    switch_break_label: Optional[str] = None
+
+    def push_loop(self, break_label: str, continue_label: str):
+        self.loop_stack.append(LoopContext(break_label, continue_label))
+
+    def pop_loop(self):
+        self.loop_stack.pop()
+
+    def get_break_label(self) -> str:
+        if self.switch_break_label:
+            return self.switch_break_label
+        if not self.loop_stack:
+            raise CompileError("break outside of loop or switch")
+        return self.loop_stack[-1].break_label
+
+    def get_continue_label(self) -> str:
+        if not self.loop_stack:
+            raise CompileError("continue outside of loop")
+        return self.loop_stack[-1].continue_label
 
     def add_local(self, name: str, jtype: JType) -> LocalVariable:
         var = LocalVariable(name, jtype, self.next_slot)
@@ -65,11 +92,25 @@ class ResolvedMethod:
     is_interface: bool
     return_type: JType
     param_types: tuple[JType, ...]
+    is_varargs: bool = False
 
 
 JAVA_LANG_CLASSES = {
     "Object", "String", "Class", "System", "Thread", "Throwable",
     "Exception", "RuntimeException", "Error",
+    # Common exceptions
+    "ArithmeticException", "ArrayIndexOutOfBoundsException", "ArrayStoreException",
+    "ClassCastException", "ClassNotFoundException", "CloneNotSupportedException",
+    "IllegalAccessException", "IllegalArgumentException", "IllegalMonitorStateException",
+    "IllegalStateException", "IllegalThreadStateException", "IndexOutOfBoundsException",
+    "InstantiationException", "InterruptedException", "NegativeArraySizeException",
+    "NoSuchFieldException", "NoSuchMethodException", "NullPointerException",
+    "NumberFormatException", "ReflectiveOperationException", "SecurityException",
+    "StringIndexOutOfBoundsException", "TypeNotPresentException",
+    "UnsupportedOperationException",
+    # Errors
+    "AssertionError", "LinkageError", "VirtualMachineError", "OutOfMemoryError",
+    "StackOverflowError", "NoClassDefFoundError", "ExceptionInInitializerError",
     "Math", "StrictMath", "Number",
     "Byte", "Short", "Integer", "Long", "Float", "Double", "Character", "Boolean",
     "StringBuilder", "StringBuffer",
@@ -78,6 +119,21 @@ JAVA_LANG_CLASSES = {
     # Annotations
     "Deprecated", "Override", "SuppressWarnings", "SafeVarargs", "FunctionalInterface",
 }
+
+# Autoboxing/unboxing mappings: primitive_descriptor -> (wrapper_class, valueOf_desc, unbox_method, unbox_desc, primitive_type)
+BOXING_MAP = {
+    'I': ('java/lang/Integer', '(I)Ljava/lang/Integer;', 'intValue', '()I'),
+    'J': ('java/lang/Long', '(J)Ljava/lang/Long;', 'longValue', '()J'),
+    'F': ('java/lang/Float', '(F)Ljava/lang/Float;', 'floatValue', '()F'),
+    'D': ('java/lang/Double', '(D)Ljava/lang/Double;', 'doubleValue', '()D'),
+    'Z': ('java/lang/Boolean', '(Z)Ljava/lang/Boolean;', 'booleanValue', '()Z'),
+    'C': ('java/lang/Character', '(C)Ljava/lang/Character;', 'charValue', '()C'),
+    'B': ('java/lang/Byte', '(B)Ljava/lang/Byte;', 'byteValue', '()B'),
+    'S': ('java/lang/Short', '(S)Ljava/lang/Short;', 'shortValue', '()S'),
+}
+
+# Reverse mapping: wrapper class internal name -> primitive descriptor
+UNBOXING_MAP = {v[0]: k for k, v in BOXING_MAP.items()}
 
 
 @dataclass
@@ -88,6 +144,16 @@ class LocalMethodInfo:
     is_static: bool
     return_type: JType
     param_types: tuple[JType, ...]
+    is_varargs: bool = False
+
+
+@dataclass
+class LocalFieldInfo:
+    """Info about a field defined in the current class."""
+    name: str
+    jtype: JType
+    descriptor: str
+    is_static: bool
 
 
 class CodeGenerator:
@@ -136,6 +202,7 @@ class CodeGenerator:
         # Check if looking in the current class being compiled
         if class_name == self.class_name and method_name in self._local_methods:
             for local_method in self._local_methods[method_name]:
+                # Exact match
                 if len(local_method.param_types) == len(arg_types):
                     return ResolvedMethod(
                         owner=self.class_name,
@@ -145,7 +212,39 @@ class CodeGenerator:
                         is_interface=False,
                         return_type=local_method.return_type,
                         param_types=local_method.param_types,
+                        is_varargs=local_method.is_varargs,
                     )
+                # Varargs match: n args can match method with m params if m >= 1 and n >= m - 1
+                if local_method.is_varargs and local_method.param_types:
+                    num_regular_params = len(local_method.param_types) - 1
+                    if len(arg_types) >= num_regular_params:
+                        # Check regular params
+                        regular_match = True
+                        for i in range(num_regular_params):
+                            if not self._type_assignable(arg_types[i], local_method.param_types[i]):
+                                regular_match = False
+                                break
+                        if regular_match:
+                            # Check varargs elements against array element type
+                            varargs_param = local_method.param_types[-1]
+                            if isinstance(varargs_param, ArrayJType):
+                                elem_type = varargs_param.element_type
+                                varargs_match = True
+                                for i in range(num_regular_params, len(arg_types)):
+                                    if not self._type_assignable(arg_types[i], elem_type):
+                                        varargs_match = False
+                                        break
+                                if varargs_match:
+                                    return ResolvedMethod(
+                                        owner=self.class_name,
+                                        name=method_name,
+                                        descriptor=local_method.descriptor,
+                                        is_static=local_method.is_static,
+                                        is_interface=False,
+                                        return_type=local_method.return_type,
+                                        param_types=local_method.param_types,
+                                        is_varargs=True,
+                                    )
 
         cls = self._lookup_class(class_name)
         if not cls:
@@ -275,6 +374,12 @@ class CodeGenerator:
 
     def _find_field(self, class_name: str, field_name: str) -> Optional[tuple[str, str, JType]]:
         """Find a field in a class. Returns (owner, descriptor, type)."""
+        # Check if it's the current class being compiled
+        if class_name == self.class_name and hasattr(self, '_local_fields'):
+            if field_name in self._local_fields:
+                field = self._local_fields[field_name]
+                return (self.class_name, field.descriptor, field.jtype)
+
         cls = self._lookup_class(class_name)
         if not cls:
             return None
@@ -341,12 +446,20 @@ class CodeGenerator:
         jtype, _ = self._parse_type_from_descriptor(desc, 0)
         return jtype
 
+    def _resolve_parameter_type(self, param: ast.FormalParameter) -> JType:
+        """Resolve parameter type, handling varargs (T... becomes T[])."""
+        base_type = self.resolve_type(param.type)
+        if param.varargs:
+            return ArrayJType(base_type, 1)
+        return base_type
+
     def _register_local_method(self, method: ast.MethodDeclaration):
         """Register a method for forward reference resolution."""
         is_static = any(m.keyword == "static" for m in method.modifiers)
         return_type = self.resolve_type(method.return_type)
-        param_types = tuple(self.resolve_type(p.type) for p in method.parameters)
+        param_types = tuple(self._resolve_parameter_type(p) for p in method.parameters)
         descriptor = MethodType(return_type, param_types).descriptor()
+        is_varargs = bool(method.parameters and method.parameters[-1].varargs)
 
         info = LocalMethodInfo(
             name=method.name,
@@ -354,11 +467,27 @@ class CodeGenerator:
             is_static=is_static,
             return_type=return_type,
             param_types=param_types,
+            is_varargs=is_varargs,
         )
 
         if method.name not in self._local_methods:
             self._local_methods[method.name] = []
         self._local_methods[method.name].append(info)
+
+    def _register_local_field(self, field: ast.FieldDeclaration):
+        """Register a field for name resolution."""
+        is_static = any(m.keyword == "static" for m in field.modifiers)
+        jtype = self.resolve_type(field.type)
+        descriptor = jtype.descriptor()
+
+        for decl in field.declarators:
+            info = LocalFieldInfo(
+                name=decl.name,
+                jtype=jtype,
+                descriptor=descriptor,
+                is_static=is_static,
+            )
+            self._local_fields[decl.name] = info
 
     def _convert_annotations(self, modifiers: tuple) -> list[AnnotationInfo]:
         """Convert AST annotations from modifiers to AnnotationInfo list."""
@@ -588,13 +717,17 @@ class CodeGenerator:
         # Generate class signature for generics
         self.class_file.signature = self._generate_class_signature(cls)
 
-        # First pass: collect method signatures for forward references
+        # First pass: collect field and method signatures for forward references
         self._local_methods = {}
+        self._local_fields = {}
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
                 self._register_local_method(member)
+            elif isinstance(member, ast.FieldDeclaration):
+                self._register_local_field(member)
 
         # Second pass: compile members
+        has_constructor = False
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
                 self.compile_method(member)
@@ -602,6 +735,11 @@ class CodeGenerator:
                 self.compile_field(member)
             elif isinstance(member, ast.ConstructorDeclaration):
                 self.compile_constructor(member)
+                has_constructor = True
+
+        # Generate default constructor if none exists
+        if not has_constructor:
+            self._generate_default_constructor()
 
         return self.class_file.to_bytes()
 
@@ -631,6 +769,27 @@ class CodeGenerator:
             )
             self.class_file.add_field(field_info)
 
+    def _generate_default_constructor(self):
+        """Generate a default no-arg constructor that calls super()."""
+        builder = BytecodeBuilder(self.class_file.cp)
+        builder.max_locals = 1  # slot 0 for 'this'
+
+        # aload_0 (load this)
+        builder.aload(0)
+        # invokespecial java/lang/Object.<init>()V
+        builder.invokespecial("java/lang/Object", "<init>", "()V", 0, 0)
+        # return
+        builder.return_()
+
+        code_attr = builder.build()
+        method_info = MethodInfo(
+            access_flags=AccessFlags.PUBLIC,
+            name="<init>",
+            descriptor="()V",
+            code=code_attr,
+        )
+        self.class_file.add_method(method_info)
+
     def compile_constructor(self, ctor: ast.ConstructorDeclaration):
         """Compile a constructor."""
         flags = 0
@@ -643,7 +802,7 @@ class CodeGenerator:
                 flags |= AccessFlags.PROTECTED
 
         # Build method descriptor
-        param_types = [self.resolve_type(p.type) for p in ctor.parameters]
+        param_types = [self._resolve_parameter_type(p) for p in ctor.parameters]
         descriptor = "(" + "".join(t.descriptor() for t in param_types) + ")V"
 
         builder = BytecodeBuilder(self.class_file.cp)
@@ -700,8 +859,12 @@ class CodeGenerator:
             elif mod.keyword == "abstract":
                 flags |= AccessFlags.ABSTRACT
 
+        # Check for varargs
+        if method.parameters and method.parameters[-1].varargs:
+            flags |= AccessFlags.VARARGS
+
         # Build method descriptor
-        param_types = [self.resolve_type(p.type) for p in method.parameters]
+        param_types = [self._resolve_parameter_type(p) for p in method.parameters]
         return_type = self.resolve_type(method.return_type)
         descriptor = MethodType(return_type, tuple(param_types)).descriptor()
 
@@ -775,7 +938,12 @@ class CodeGenerator:
             for decl in stmt.declarators:
                 var = ctx.add_local(decl.name, jtype)
                 if decl.initializer:
-                    self.compile_expression(decl.initializer, ctx)
+                    # Handle array initializer: int[] arr = {1, 2, 3}
+                    if isinstance(decl.initializer, ast.ArrayInitializer) and isinstance(jtype, ArrayJType):
+                        self._compile_array_initializer(decl.initializer, jtype, ctx)
+                    else:
+                        expr_type = self.compile_expression(decl.initializer, ctx)
+                        self.emit_conversion(expr_type, jtype, builder)
                     self.store_local(var, builder)
 
         elif isinstance(stmt, ast.ExpressionStatement):
@@ -832,16 +1000,22 @@ class CodeGenerator:
 
             builder.label(loop_label)
             self.compile_condition(stmt.condition, ctx, end_label, False)
+            ctx.push_loop(end_label, loop_label)
             self.compile_statement(stmt.body, ctx)
+            ctx.pop_loop()
             builder.goto(loop_label)
             builder.label(end_label)
 
         elif isinstance(stmt, ast.DoWhileStatement):
             loop_label = self.new_label("do")
+            end_label = self.new_label("enddo")
 
             builder.label(loop_label)
+            ctx.push_loop(end_label, loop_label)
             self.compile_statement(stmt.body, ctx)
+            ctx.pop_loop()
             self.compile_condition(stmt.condition, ctx, loop_label, True)
+            builder.label(end_label)
 
         elif isinstance(stmt, ast.ForStatement):
             loop_label = self.new_label("for")
@@ -864,8 +1038,10 @@ class CodeGenerator:
             if stmt.condition:
                 self.compile_condition(stmt.condition, ctx, end_label, False)
 
-            # Body
+            # Body (continue goes to update_label, break goes to end_label)
+            ctx.push_loop(end_label, update_label)
             self.compile_statement(stmt.body, ctx)
+            ctx.pop_loop()
 
             builder.label(update_label)
 
@@ -878,11 +1054,225 @@ class CodeGenerator:
             builder.goto(loop_label)
             builder.label(end_label)
 
+        elif isinstance(stmt, ast.EnhancedForStatement):
+            # for (T x : arr) { body }
+            # becomes:
+            # T[] $arr = arr;
+            # int $len = $arr.length;
+            # for (int $i = 0; $i < $len; $i++) { T x = $arr[$i]; body }
+            loop_label = self.new_label("foreach")
+            end_label = self.new_label("endforeach")
+            update_label = self.new_label("foreach_update")
+
+            # Compile the iterable and get its type
+            iterable_type = self.compile_expression(stmt.iterable, ctx)
+
+            if not isinstance(iterable_type, ArrayJType):
+                raise CompileError(f"Enhanced for loop requires array type, got: {iterable_type}")
+
+            elem_type = iterable_type.element_type
+
+            # Store array reference in temp local
+            arr_var = ctx.add_local("$arr", iterable_type)
+            self.store_local(arr_var, builder)
+
+            # Get length and store in temp local
+            self.load_local(arr_var, builder)
+            builder.arraylength()
+            len_var = ctx.add_local("$len", INT)
+            self.store_local(len_var, builder)
+
+            # Initialize index to 0
+            builder.iconst(0)
+            idx_var = ctx.add_local("$i", INT)
+            self.store_local(idx_var, builder)
+
+            # Loop start
+            builder.label(loop_label)
+
+            # Condition: $i < $len
+            self.load_local(idx_var, builder)
+            self.load_local(len_var, builder)
+            builder.if_icmpge(end_label)
+
+            # T x = $arr[$i]
+            elem_var_type = self.resolve_type(stmt.type)
+            elem_var = ctx.add_local(stmt.name, elem_var_type)
+            self.load_local(arr_var, builder)
+            self.load_local(idx_var, builder)
+            self._emit_array_load(elem_type, builder)
+            self.store_local(elem_var, builder)
+
+            # Body
+            ctx.push_loop(end_label, update_label)
+            self.compile_statement(stmt.body, ctx)
+            ctx.pop_loop()
+
+            # $i++
+            builder.label(update_label)
+            builder.iinc(idx_var.slot, 1)
+            builder.goto(loop_label)
+
+            builder.label(end_label)
+
+        elif isinstance(stmt, ast.SwitchStatement):
+            self._compile_switch(stmt, ctx)
+
+        elif isinstance(stmt, ast.BreakStatement):
+            builder.goto(ctx.get_break_label())
+
+        elif isinstance(stmt, ast.ContinueStatement):
+            builder.goto(ctx.get_continue_label())
+
+        elif isinstance(stmt, ast.TryStatement):
+            self._compile_try(stmt, ctx)
+
+        elif isinstance(stmt, ast.ThrowStatement):
+            self.compile_expression(stmt.expression, ctx)
+            builder.athrow()
+
         elif isinstance(stmt, ast.EmptyStatement):
             pass
 
         else:
             raise CompileError(f"Unsupported statement type: {type(stmt).__name__}")
+
+    def _compile_switch(self, stmt: ast.SwitchStatement, ctx: MethodContext):
+        """Compile a switch statement."""
+        builder = ctx.builder
+        end_label = self.new_label("endswitch")
+
+        # Compile the switch expression
+        self.compile_expression(stmt.expression, ctx)
+
+        # Collect case values and labels
+        cases: list[tuple[int, str]] = []
+        default_label = end_label  # Default to end if no default case
+        case_labels: list[str] = []
+
+        for case in stmt.cases:
+            case_label = self.new_label("case")
+            case_labels.append(case_label)
+
+            for label in case.labels:
+                if label is None:
+                    # Default case
+                    default_label = case_label
+                else:
+                    # Get the constant value
+                    if isinstance(label, ast.Literal) and label.kind == "int":
+                        value = self.parse_int_literal(label.value)
+                        cases.append((value, case_label))
+                    else:
+                        raise CompileError(f"Switch case label must be an integer constant: {label}")
+
+        # Emit lookupswitch
+        builder.lookupswitch(default_label, cases)
+
+        # Set switch break label
+        old_switch_break = ctx.switch_break_label
+        ctx.switch_break_label = end_label
+
+        # Emit case bodies
+        for i, case in enumerate(stmt.cases):
+            builder.label(case_labels[i])
+            for stmt_in_case in case.statements:
+                self.compile_statement(stmt_in_case, ctx)
+
+        # Restore switch break label
+        ctx.switch_break_label = old_switch_break
+
+        builder.label(end_label)
+
+    def _compile_try(self, stmt: ast.TryStatement, ctx: MethodContext):
+        """Compile a try-catch-finally statement."""
+        builder = ctx.builder
+
+        try_start = self.new_label("try_start")
+        try_end = self.new_label("try_end")
+        end_label = self.new_label("try_done")
+
+        # Labels for catch handlers
+        catch_labels = []
+        for catch in stmt.catches:
+            catch_labels.append(self.new_label("catch"))
+
+        # Label for finally (if present)
+        finally_label = None
+        if stmt.finally_block:
+            finally_label = self.new_label("finally")
+
+        # Compile try block
+        builder.label(try_start)
+        self.compile_block(stmt.body, ctx)
+        builder.label(try_end)
+
+        # If there's a finally block, execute it before going to end
+        if stmt.finally_block:
+            self.compile_block(stmt.finally_block, ctx)
+
+        builder.goto(end_label)
+
+        # Compile catch handlers
+        for i, catch in enumerate(stmt.catches):
+            builder.label(catch_labels[i])
+
+            # At handler entry, exception reference is on stack
+            # Store it in local variable
+            exc_type = self.resolve_type(catch.types[0])  # For now, only handle single type
+            exc_var = ctx.add_local(catch.name, exc_type)
+
+            # Exception is pushed by JVM when handler is entered
+            builder._push()  # Account for exception on stack
+            self.store_local(exc_var, builder)
+
+            # Compile catch body
+            self.compile_block(catch.body, ctx)
+
+            # If there's a finally block, execute it
+            if stmt.finally_block:
+                self.compile_block(stmt.finally_block, ctx)
+
+            builder.goto(end_label)
+
+            # Register exception handlers for this catch
+            for catch_type in catch.types:
+                exc_class = self._resolve_class_name(catch_type.name if isinstance(catch_type, ast.ClassType) else str(catch_type))
+                catch_type_idx = builder.cp.add_class(exc_class)
+                builder.add_exception_handler(try_start, try_end, catch_labels[i], catch_type_idx)
+
+        # Compile finally handler (catches any exception)
+        if stmt.finally_block:
+            finally_exception_handler = self.new_label("finally_handler")
+            builder.label(finally_exception_handler)
+
+            # Store exception in temp var
+            exc_slot = ctx.next_slot
+            ctx.next_slot += 1
+            builder.max_locals = max(builder.max_locals, ctx.next_slot)
+            builder._push()  # Exception is on stack
+            builder.astore(exc_slot)
+
+            # Execute finally block
+            self.compile_block(stmt.finally_block, ctx)
+
+            # Re-throw the exception
+            builder.aload(exc_slot)
+            builder.athrow()
+
+            # Register catch-all handler (catch_type=0)
+            builder.add_exception_handler(try_start, try_end, finally_exception_handler, 0)
+
+            # Also need to handle exceptions in catch blocks if there are any
+            for i, catch_label in enumerate(catch_labels):
+                # Get the end of catch block (start of next catch or finally_exception_handler)
+                if i + 1 < len(catch_labels):
+                    catch_end = catch_labels[i + 1]
+                else:
+                    catch_end = finally_exception_handler
+                builder.add_exception_handler(catch_labels[i], catch_end, finally_exception_handler, 0)
+
+        builder.label(end_label)
 
     def compile_condition(self, expr: ast.Expression, ctx: MethodContext,
                           target: str, jump_if_true: bool):
@@ -1076,9 +1466,21 @@ class CodeGenerator:
             return self.compile_literal(expr, ctx)
 
         elif isinstance(expr, ast.Identifier):
-            var = ctx.get_local(expr.name)
-            self.load_local(var, builder)
-            return var.type
+            # Check locals first
+            if expr.name in ctx.locals:
+                var = ctx.get_local(expr.name)
+                self.load_local(var, builder)
+                return var.type
+            # Check class fields
+            if hasattr(self, '_local_fields') and expr.name in self._local_fields:
+                field = self._local_fields[expr.name]
+                if field.is_static:
+                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)  # load this
+                    builder.getfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+            raise CompileError(f"Undefined variable: {expr.name}")
 
         elif isinstance(expr, ast.ParenthesizedExpression):
             return self.compile_expression(expr.expression, ctx)
@@ -1111,6 +1513,28 @@ class CodeGenerator:
             else:
                 raise CompileError(f"Invalid instanceof type: {target_type}")
             return BOOLEAN
+
+        elif isinstance(expr, ast.ThisExpression):
+            builder.aload(0)
+            return ClassJType(self.class_name)
+
+        elif isinstance(expr, ast.FieldAccess):
+            return self.compile_field_access(expr, ctx)
+
+        elif isinstance(expr, ast.NewInstance):
+            return self.compile_new_instance(expr, ctx)
+
+        elif isinstance(expr, ast.QualifiedName):
+            return self.compile_qualified_name(expr, ctx)
+
+        elif isinstance(expr, ast.NewArray):
+            return self.compile_new_array(expr, ctx)
+
+        elif isinstance(expr, ast.ArrayAccess):
+            return self.compile_array_access(expr, ctx)
+
+        elif isinstance(expr, ast.ArrayInitializer):
+            raise CompileError("ArrayInitializer must be part of NewArray or variable declaration")
 
         else:
             raise CompileError(f"Unsupported expression type: {type(expr).__name__}")
@@ -1264,7 +1688,8 @@ class CodeGenerator:
         op = expr.operator
 
         # Special handling for string concatenation
-        # For now, just handle numeric operations
+        if op == "+" and self._is_string_concat(expr, ctx):
+            return self.compile_string_concat(expr, ctx)
 
         left_type = self.compile_expression(expr.left, ctx)
         right_type = self.compile_expression(expr.right, ctx)
@@ -1401,6 +1826,75 @@ class CodeGenerator:
 
         return result_type
 
+    def _is_string_concat(self, expr: ast.BinaryExpression, ctx: MethodContext) -> bool:
+        """Check if a binary expression is string concatenation."""
+        if expr.operator != "+":
+            return False
+        left_type = self._estimate_expression_type(expr.left, ctx)
+        right_type = self._estimate_expression_type(expr.right, ctx)
+        return left_type == STRING or right_type == STRING
+
+    def _collect_concat_parts(self, expr: ast.Expression, parts: list, ctx: MethodContext):
+        """Collect all parts of a string concatenation expression."""
+        if isinstance(expr, ast.BinaryExpression) and expr.operator == "+":
+            left_type = self._estimate_expression_type(expr.left, ctx)
+            right_type = self._estimate_expression_type(expr.right, ctx)
+            if left_type == STRING or right_type == STRING:
+                self._collect_concat_parts(expr.left, parts, ctx)
+                self._collect_concat_parts(expr.right, parts, ctx)
+                return
+        parts.append(expr)
+
+    def compile_string_concat(self, expr: ast.BinaryExpression, ctx: MethodContext) -> JType:
+        """Compile string concatenation using StringBuilder."""
+        builder = ctx.builder
+
+        # Collect all parts of the concatenation
+        parts = []
+        self._collect_concat_parts(expr, parts, ctx)
+
+        # Create StringBuilder: new StringBuilder()
+        builder.new("java/lang/StringBuilder")
+        builder.dup()
+        builder.invokespecial("java/lang/StringBuilder", "<init>", "()V", 0, 0)
+
+        # Append each part
+        for part in parts:
+            part_type = self.compile_expression(part, ctx)
+
+            # Choose the right append method based on type
+            if part_type == STRING:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(Ljava/lang/String;)Ljava/lang/StringBuilder;", 1, 1)
+            elif part_type == INT:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(I)Ljava/lang/StringBuilder;", 1, 1)
+            elif part_type == LONG:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(J)Ljava/lang/StringBuilder;", 2, 1)
+            elif part_type == FLOAT:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(F)Ljava/lang/StringBuilder;", 1, 1)
+            elif part_type == DOUBLE:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(D)Ljava/lang/StringBuilder;", 2, 1)
+            elif part_type == BOOLEAN:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(Z)Ljava/lang/StringBuilder;", 1, 1)
+            elif part_type == CHAR:
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(C)Ljava/lang/StringBuilder;", 1, 1)
+            else:
+                # Reference type - use append(Object)
+                builder.invokevirtual("java/lang/StringBuilder", "append",
+                                      "(Ljava/lang/Object;)Ljava/lang/StringBuilder;", 1, 1)
+
+        # Call toString()
+        builder.invokevirtual("java/lang/StringBuilder", "toString",
+                              "()Ljava/lang/String;", 0, 1)
+
+        return STRING
+
     def compile_unary(self, expr: ast.UnaryExpression, ctx: MethodContext) -> JType:
         builder = ctx.builder
         op = expr.operator
@@ -1446,17 +1940,64 @@ class CodeGenerator:
         elif op == "++" or op == "--":
             if not isinstance(expr.operand, ast.Identifier):
                 raise CompileError("Increment/decrement requires variable")
-            var = ctx.get_local(expr.operand.name)
-            if var.type != INT:
-                raise CompileError("Increment/decrement only supported for int")
+            name = expr.operand.name
+            delta = 1 if op == "++" else -1
 
-            if expr.prefix:
-                builder.iinc(var.slot, 1 if op == "++" else -1)
-                builder.iload(var.slot)
-            else:
-                builder.iload(var.slot)
-                builder.iinc(var.slot, 1 if op == "++" else -1)
-            return INT
+            # Check if it's a local variable
+            if name in ctx.locals:
+                var = ctx.get_local(name)
+                if var.type != INT:
+                    raise CompileError("Increment/decrement only supported for int")
+                if expr.prefix:
+                    builder.iinc(var.slot, delta)
+                    builder.iload(var.slot)
+                else:
+                    builder.iload(var.slot)
+                    builder.iinc(var.slot, delta)
+                return INT
+
+            # Check if it's a field
+            if hasattr(self, '_local_fields') and name in self._local_fields:
+                field = self._local_fields[name]
+                if field.jtype != INT:
+                    raise CompileError("Increment/decrement only supported for int")
+
+                if field.is_static:
+                    if expr.prefix:
+                        # ++count: load, add 1, dup, store
+                        builder.getstatic(self.class_name, field.name, field.descriptor)
+                        builder.iconst(delta)
+                        builder.iadd()
+                        builder.dup()
+                        builder.putstatic(self.class_name, field.name, field.descriptor)
+                    else:
+                        # count++: load, dup, add 1, store
+                        builder.getstatic(self.class_name, field.name, field.descriptor)
+                        builder.dup()
+                        builder.iconst(delta)
+                        builder.iadd()
+                        builder.putstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    # Instance field
+                    if expr.prefix:
+                        builder.aload(0)
+                        builder.dup()
+                        builder.getfield(self.class_name, field.name, field.descriptor)
+                        builder.iconst(delta)
+                        builder.iadd()
+                        builder.dup_x1()
+                        builder.putfield(self.class_name, field.name, field.descriptor)
+                    else:
+                        builder.aload(0)
+                        builder.dup()
+                        builder.getfield(self.class_name, field.name, field.descriptor)
+                        builder.dup_x1()
+                        builder.iconst(delta)
+                        builder.iadd()
+                        builder.putfield(self.class_name, field.name, field.descriptor)
+                return INT
+
+            raise CompileError(f"Undefined variable: {name}")
 
         else:
             raise CompileError(f"Unsupported unary operator: {op}")
@@ -1464,47 +2005,221 @@ class CodeGenerator:
     def compile_assignment(self, expr: ast.Assignment, ctx: MethodContext) -> JType:
         builder = ctx.builder
 
-        if not isinstance(expr.target, ast.Identifier):
-            raise CompileError("Only simple variable assignment supported")
+        # Handle FieldAccess target (this.x = value or obj.field = value)
+        if isinstance(expr.target, ast.FieldAccess):
+            return self._compile_field_assignment(expr, ctx)
 
-        var = ctx.get_local(expr.target.name)
+        # Handle QualifiedName target (e.g., this.x = value)
+        if isinstance(expr.target, ast.QualifiedName):
+            return self._compile_qualified_assignment(expr, ctx)
+
+        # Handle ArrayAccess target (arr[i] = value)
+        if isinstance(expr.target, ast.ArrayAccess):
+            return self._compile_array_assignment(expr, ctx)
+
+        # Handle simple Identifier target
+        if isinstance(expr.target, ast.Identifier):
+            name = expr.target.name
+
+            # Check if it's a local variable
+            if name in ctx.locals:
+                var = ctx.get_local(name)
+
+                if expr.operator == "=":
+                    self.compile_expression(expr.value, ctx)
+                else:
+                    # Compound assignment: +=, -=, etc.
+                    self.load_local(var, builder)
+                    self.compile_expression(expr.value, ctx)
+                    self._compile_compound_op(expr.operator, var.type, builder)
+
+                builder.dup()
+                self.store_local(var, builder)
+                return var.type
+
+            # Check if it's an instance/static field
+            if hasattr(self, '_local_fields') and name in self._local_fields:
+                field = self._local_fields[name]
+
+                if field.is_static:
+                    if expr.operator != "=":
+                        builder.getstatic(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup()
+                    builder.putstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)  # load this
+                    if expr.operator != "=":
+                        builder.dup()
+                        builder.getfield(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup_x1()
+                    builder.putfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+
+            raise CompileError(f"Undefined variable: {name}")
+
+        raise CompileError(f"Unsupported assignment target: {type(expr.target).__name__}")
+
+    def _compile_field_assignment(self, expr: ast.Assignment, ctx: MethodContext) -> JType:
+        """Compile assignment to a field (this.x = value or obj.field = value)."""
+        builder = ctx.builder
+        fa = expr.target
+
+        # Handle this.field = value
+        if isinstance(fa.target, ast.ThisExpression):
+            if hasattr(self, '_local_fields') and fa.field in self._local_fields:
+                field = self._local_fields[fa.field]
+                if field.is_static:
+                    if expr.operator != "=":
+                        builder.getstatic(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup()
+                    builder.putstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)
+                    if expr.operator != "=":
+                        builder.dup()
+                        builder.getfield(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup_x1()
+                    builder.putfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+            raise CompileError(f"Unknown field: {fa.field}")
+
+        # Handle obj.field = value
+        target_type = self.compile_expression(fa.target, ctx)
+        if not isinstance(target_type, ClassJType):
+            raise CompileError(f"Cannot access field on type: {target_type}")
+
+        field_info = self._find_field(target_type.internal_name(), fa.field)
+        if field_info:
+            owner, desc, ftype = field_info
+            if expr.operator != "=":
+                builder.dup()
+                builder.getfield(owner, fa.field, desc)
+                self.compile_expression(expr.value, ctx)
+                self._compile_compound_op(expr.operator, ftype, builder)
+            else:
+                self.compile_expression(expr.value, ctx)
+            builder.dup_x1()
+            builder.putfield(owner, fa.field, desc)
+            return ftype
+
+        raise CompileError(f"Unknown field: {target_type.internal_name()}.{fa.field}")
+
+    def _compile_array_assignment(self, expr: ast.Assignment, ctx: MethodContext) -> JType:
+        """Compile assignment to an array element (arr[i] = value)."""
+        builder = ctx.builder
+        aa = expr.target
+
+        # Compile array reference
+        array_type = self.compile_expression(aa.array, ctx)
+        if not isinstance(array_type, ArrayJType):
+            raise CompileError(f"Cannot index non-array type: {array_type}")
+
+        elem_type = array_type.element_type
+
+        # Compile index
+        self.compile_expression(aa.index, ctx)
 
         if expr.operator == "=":
+            # Simple assignment: arr[i] = value
             self.compile_expression(expr.value, ctx)
         else:
-            # Compound assignment: +=, -=, etc.
-            self.load_local(var, builder)
-            self.compile_expression(expr.value, ctx)
+            # Compound assignment: arr[i] += value
+            # Stack: arrayref, index
+            # Need to dup2 to keep arrayref and index for the store
+            builder.dup2()  # arrayref, index, arrayref, index
+            self._emit_array_load(elem_type, builder)  # arrayref, index, value
+            self.compile_expression(expr.value, ctx)  # arrayref, index, value, rhs
+            self._compile_compound_op(expr.operator, elem_type, builder)  # arrayref, index, result
 
-            base_op = expr.operator[:-1]
-            if var.type == INT:
-                if base_op == "+":
-                    builder.iadd()
-                elif base_op == "-":
-                    builder.isub()
-                elif base_op == "*":
-                    builder.imul()
-                elif base_op == "/":
-                    builder.idiv()
-                elif base_op == "%":
-                    builder.irem()
-                elif base_op == "&":
-                    builder.iand()
-                elif base_op == "|":
-                    builder.ior()
-                elif base_op == "^":
-                    builder.ixor()
-                elif base_op == "<<":
-                    builder.ishl()
-                elif base_op == ">>":
-                    builder.ishr()
-                elif base_op == ">>>":
-                    builder.iushr()
+        # Stack: arrayref, index, value
+        # dup value under array ref and index for expression result
+        if elem_type.size == 2:
+            builder.dup2_x2()  # value, arrayref, index, value
+        else:
+            builder.dup_x2()  # value, arrayref, index, value
 
-        # Duplicate value for expression result, then store
-        builder.dup()
-        self.store_local(var, builder)
-        return var.type
+        # Store to array
+        self._emit_array_store(elem_type, builder)
+
+        return elem_type
+
+    def _compile_qualified_assignment(self, expr: ast.Assignment, ctx: MethodContext) -> JType:
+        """Compile assignment to a qualified name (e.g., this.x = value)."""
+        builder = ctx.builder
+        qn = expr.target
+
+        # Handle this.field = value
+        if qn.parts[0] == "this" and len(qn.parts) == 2:
+            field_name = qn.parts[1]
+            if hasattr(self, '_local_fields') and field_name in self._local_fields:
+                field = self._local_fields[field_name]
+                if field.is_static:
+                    if expr.operator != "=":
+                        builder.getstatic(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup()
+                    builder.putstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)
+                    if expr.operator != "=":
+                        builder.dup()
+                        builder.getfield(self.class_name, field.name, field.descriptor)
+                        self.compile_expression(expr.value, ctx)
+                        self._compile_compound_op(expr.operator, field.jtype, builder)
+                    else:
+                        self.compile_expression(expr.value, ctx)
+                    builder.dup_x1()
+                    builder.putfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+            raise CompileError(f"Unknown field: {field_name}")
+
+        raise CompileError(f"Unsupported qualified name assignment: {qn.parts}")
+
+    def _compile_compound_op(self, operator: str, jtype: JType, builder: BytecodeBuilder):
+        """Compile the operation part of a compound assignment."""
+        base_op = operator[:-1]
+        if jtype == INT:
+            if base_op == "+":
+                builder.iadd()
+            elif base_op == "-":
+                builder.isub()
+            elif base_op == "*":
+                builder.imul()
+            elif base_op == "/":
+                builder.idiv()
+            elif base_op == "%":
+                builder.irem()
+            elif base_op == "&":
+                builder.iand()
+            elif base_op == "|":
+                builder.ior()
+            elif base_op == "^":
+                builder.ixor()
+            elif base_op == "<<":
+                builder.ishl()
+            elif base_op == ">>":
+                builder.ishr()
+            elif base_op == ">>>":
+                builder.iushr()
 
     def compile_method_call(self, expr: ast.MethodInvocation, ctx: MethodContext) -> JType:
         builder = ctx.builder
@@ -1591,14 +2306,22 @@ class CodeGenerator:
                 resolved_name = self._resolve_class_name(expr.target.name)
                 target_type = ClassJType(resolved_name)
         elif isinstance(expr.target, ast.QualifiedName):
-            # e.g., java.lang.Math.abs() or Math.abs() - class name for static call
-            is_static_call = True
+            # Could be a local variable (single name) or a class name for static call
             if len(expr.target.parts) == 1:
-                # Single name like "Math" - resolve it
-                resolved_name = self._resolve_class_name(expr.target.parts[0])
-                target_type = ClassJType(resolved_name)
+                first_part = expr.target.parts[0]
+                # Check if it's a local variable
+                if first_part in ctx.locals:
+                    var = ctx.get_local(first_part)
+                    self.load_local(var, builder)
+                    target_type = var.type
+                else:
+                    # Assume it's a class name (static call)
+                    is_static_call = True
+                    resolved_name = self._resolve_class_name(first_part)
+                    target_type = ClassJType(resolved_name)
             else:
-                # Qualified name like "java.lang.Math"
+                # Qualified name like "java.lang.Math" - assume static call
+                is_static_call = True
                 class_name = "/".join(expr.target.parts)
                 target_type = ClassJType(class_name)
         elif isinstance(expr.target, ast.FieldAccess):
@@ -1633,8 +2356,39 @@ class CodeGenerator:
             builder.aload(0)  # load 'this'
 
         # Compile arguments
-        for arg in expr.arguments:
-            self.compile_expression(arg, ctx)
+        if resolved.is_varargs and resolved.param_types:
+            # Handle varargs - package trailing arguments into an array
+            num_regular = len(resolved.param_types) - 1
+            varargs_type = resolved.param_types[-1]  # This is an ArrayJType
+
+            # Compile regular (non-varargs) arguments
+            for i in range(num_regular):
+                self.compile_expression(expr.arguments[i], ctx)
+
+            # Package remaining arguments into an array
+            varargs_args = expr.arguments[num_regular:]
+            varargs_count = len(varargs_args)
+
+            # Get the element type
+            if isinstance(varargs_type, ArrayJType):
+                elem_type = varargs_type.element_type
+            else:
+                raise CompileError(f"Varargs parameter must be array type, got: {varargs_type}")
+
+            # Create the array
+            builder.iconst(varargs_count)
+            self._emit_newarray(elem_type, builder)
+
+            # Fill the array
+            for i, arg in enumerate(varargs_args):
+                builder.dup()  # dup array ref
+                builder.iconst(i)  # push index
+                self.compile_expression(arg, ctx)  # push value
+                self._emit_array_store(elem_type, builder)
+        else:
+            # Normal argument compilation
+            for arg in expr.arguments:
+                self.compile_expression(arg, ctx)
 
         # Calculate stack effect
         args_slots = sum(t.size for t in resolved.param_types)
@@ -1686,6 +2440,55 @@ class CodeGenerator:
             return ftype
 
         raise CompileError(f"Cannot find field: {target_type.internal_name()}.{fa.field}")
+
+    def compile_qualified_name(self, expr: ast.QualifiedName, ctx: MethodContext) -> JType:
+        """Compile a qualified name expression (e.g., this.x or obj.field)."""
+        builder = ctx.builder
+
+        # Handle this.field
+        if expr.parts[0] == "this" and len(expr.parts) == 2:
+            field_name = expr.parts[1]
+            if hasattr(self, '_local_fields') and field_name in self._local_fields:
+                field = self._local_fields[field_name]
+                if field.is_static:
+                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)
+                    builder.getfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+            raise CompileError(f"Unknown field: {field_name}")
+
+        # Check if first part is a local variable (e.g., obj.field)
+        if expr.parts[0] in ctx.locals:
+            var = ctx.get_local(expr.parts[0])
+            self.load_local(var, builder)
+            current_type = var.type
+
+            # Follow chain of field accesses
+            for part in expr.parts[1:]:
+                # Handle array.length
+                if isinstance(current_type, ArrayJType):
+                    if part == "length":
+                        builder.arraylength()
+                        current_type = INT
+                    else:
+                        raise CompileError(f"Arrays only have 'length' field, not: {part}")
+                elif isinstance(current_type, ClassJType):
+                    field_info = self._find_field(current_type.internal_name(), part)
+                    if not field_info:
+                        raise CompileError(f"Unknown field: {current_type.internal_name()}.{part}")
+                    owner, desc, ftype = field_info
+                    builder.getfield(owner, part, desc)
+                    current_type = ftype
+                else:
+                    raise CompileError(f"Cannot access field on type: {current_type}")
+
+            return current_type
+
+        # For other qualified names, they might be class names or package paths
+        # For now, just return a ClassJType for the full path
+        full_name = "/".join(expr.parts)
+        return ClassJType(full_name)
 
     def compile_ternary(self, expr: ast.ConditionalExpression, ctx: MethodContext) -> JType:
         builder = ctx.builder
@@ -1744,6 +2547,213 @@ class CodeGenerator:
 
         return target_type
 
+    def compile_field_access(self, expr: ast.FieldAccess, ctx: MethodContext) -> JType:
+        """Compile a field access expression (obj.field or this.field)."""
+        builder = ctx.builder
+
+        # Handle this.field
+        if isinstance(expr.target, ast.ThisExpression):
+            if hasattr(self, '_local_fields') and expr.field in self._local_fields:
+                field = self._local_fields[expr.field]
+                if field.is_static:
+                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                else:
+                    builder.aload(0)
+                    builder.getfield(self.class_name, field.name, field.descriptor)
+                return field.jtype
+            raise CompileError(f"Unknown field: {expr.field}")
+
+        # Compile the target expression
+        target_type = self.compile_expression(expr.target, ctx)
+
+        # Handle array.length
+        if isinstance(target_type, ArrayJType):
+            if expr.field == "length":
+                builder.arraylength()
+                return INT
+            raise CompileError(f"Arrays only have 'length' field, not: {expr.field}")
+
+        if not isinstance(target_type, ClassJType):
+            raise CompileError(f"Cannot access field on type: {target_type}")
+
+        # Look up the field
+        field_info = self._find_field(target_type.internal_name(), expr.field)
+        if field_info:
+            owner, desc, ftype = field_info
+            builder.getfield(owner, expr.field, desc)
+            return ftype
+
+        raise CompileError(f"Unknown field: {target_type.internal_name()}.{expr.field}")
+
+    def compile_new_instance(self, expr: ast.NewInstance, ctx: MethodContext) -> JType:
+        """Compile a new instance creation expression."""
+        builder = ctx.builder
+
+        type_name = self._resolve_class_name(expr.type.name) if isinstance(expr.type, ast.ClassType) else str(expr.type)
+
+        # new ClassName
+        builder.new(type_name)
+        builder.dup()
+
+        # Compile constructor arguments
+        arg_types = []
+        for arg in expr.arguments:
+            arg_type = self.compile_expression(arg, ctx)
+            arg_types.append(arg_type)
+
+        # Build descriptor for constructor
+        desc = "(" + "".join(t.descriptor() for t in arg_types) + ")V"
+
+        # Invoke constructor
+        args_slots = sum(t.size for t in arg_types)
+        builder.invokespecial(type_name, "<init>", desc, args_slots, 0)
+
+        return ClassJType(type_name)
+
+    def compile_new_array(self, expr: ast.NewArray, ctx: MethodContext) -> JType:
+        """Compile array creation: new int[10] or new int[] {1, 2}"""
+        builder = ctx.builder
+
+        # Resolve element type
+        elem_type = self.resolve_type(expr.type)
+        array_type = ArrayJType(elem_type)
+
+        if expr.initializer:
+            # Array with initializer: new int[] {1, 2, 3}
+            elements = expr.initializer.elements
+            size = len(elements)
+
+            # Push array size
+            builder.iconst(size)
+
+            # Create array
+            self._emit_newarray(elem_type, builder)
+
+            # Fill array with elements
+            for i, element in enumerate(elements):
+                builder.dup()  # dup array ref
+                builder.iconst(i)  # push index
+                self.compile_expression(element, ctx)  # push value
+                self._emit_array_store(elem_type, builder)
+
+        else:
+            # Array with size: new int[10]
+            if expr.dimensions and expr.dimensions[0] is not None:
+                self.compile_expression(expr.dimensions[0], ctx)
+            else:
+                raise CompileError("Array creation requires size or initializer")
+
+            self._emit_newarray(elem_type, builder)
+
+        return array_type
+
+    def _emit_newarray(self, elem_type: JType, builder: BytecodeBuilder):
+        """Emit newarray or anewarray based on element type."""
+        # newarray type codes: T_BOOLEAN=4, T_CHAR=5, T_FLOAT=6, T_DOUBLE=7, T_BYTE=8, T_SHORT=9, T_INT=10, T_LONG=11
+        if elem_type == BOOLEAN:
+            builder.newarray(4)
+        elif elem_type == CHAR:
+            builder.newarray(5)
+        elif elem_type == FLOAT:
+            builder.newarray(6)
+        elif elem_type == DOUBLE:
+            builder.newarray(7)
+        elif elem_type == BYTE:
+            builder.newarray(8)
+        elif elem_type == SHORT:
+            builder.newarray(9)
+        elif elem_type == INT:
+            builder.newarray(10)
+        elif elem_type == LONG:
+            builder.newarray(11)
+        elif isinstance(elem_type, ClassJType):
+            builder.anewarray(elem_type.internal_name())
+        elif isinstance(elem_type, ArrayJType):
+            builder.anewarray(elem_type.descriptor())
+        else:
+            raise CompileError(f"Unsupported array element type: {elem_type}")
+
+    def compile_array_access(self, expr: ast.ArrayAccess, ctx: MethodContext) -> JType:
+        """Compile array access: arr[index]"""
+        builder = ctx.builder
+
+        # Compile array reference
+        array_type = self.compile_expression(expr.array, ctx)
+
+        if not isinstance(array_type, ArrayJType):
+            raise CompileError(f"Cannot index non-array type: {array_type}")
+
+        # Compile index
+        self.compile_expression(expr.index, ctx)
+
+        # Load element
+        elem_type = array_type.element_type
+        self._emit_array_load(elem_type, builder)
+
+        return elem_type
+
+    def _emit_array_load(self, elem_type: JType, builder: BytecodeBuilder):
+        """Emit appropriate array load instruction."""
+        if elem_type == INT:
+            builder.iaload()
+        elif elem_type == LONG:
+            builder.laload()
+        elif elem_type == FLOAT:
+            builder.faload()
+        elif elem_type == DOUBLE:
+            builder.daload()
+        elif elem_type == BYTE or elem_type == BOOLEAN:
+            builder.baload()
+        elif elem_type == CHAR:
+            builder.caload()
+        elif elem_type == SHORT:
+            builder.saload()
+        elif isinstance(elem_type, (ClassJType, ArrayJType)):
+            builder.aaload()
+        else:
+            raise CompileError(f"Unsupported array element type: {elem_type}")
+
+    def _emit_array_store(self, elem_type: JType, builder: BytecodeBuilder):
+        """Emit appropriate array store instruction."""
+        if elem_type == INT:
+            builder.iastore()
+        elif elem_type == LONG:
+            builder.lastore()
+        elif elem_type == FLOAT:
+            builder.fastore()
+        elif elem_type == DOUBLE:
+            builder.dastore()
+        elif elem_type == BYTE or elem_type == BOOLEAN:
+            builder.bastore()
+        elif elem_type == CHAR:
+            builder.castore()
+        elif elem_type == SHORT:
+            builder.sastore()
+        elif isinstance(elem_type, (ClassJType, ArrayJType)):
+            builder.aastore()
+        else:
+            raise CompileError(f"Unsupported array element type: {elem_type}")
+
+    def _compile_array_initializer(self, init: ast.ArrayInitializer, array_type: ArrayJType, ctx: MethodContext):
+        """Compile an array initializer: {1, 2, 3}"""
+        builder = ctx.builder
+        elem_type = array_type.element_type
+        elements = init.elements
+        size = len(elements)
+
+        # Push array size
+        builder.iconst(size)
+
+        # Create array
+        self._emit_newarray(elem_type, builder)
+
+        # Fill array with elements
+        for i, element in enumerate(elements):
+            builder.dup()  # dup array ref
+            builder.iconst(i)  # push index
+            self.compile_expression(element, ctx)  # push value
+            self._emit_array_store(elem_type, builder)
+
     def load_local(self, var: LocalVariable, builder: BytecodeBuilder):
         if var.type == INT or var.type == BOOLEAN or var.type == BYTE or var.type == CHAR or var.type == SHORT:
             builder.iload(var.slot)
@@ -1767,6 +2777,59 @@ class CodeGenerator:
             builder.dstore(var.slot)
         elif var.type.is_reference:
             builder.astore(var.slot)
+
+    def emit_boxing(self, primitive_type: JType, builder: BytecodeBuilder) -> ClassJType:
+        """Box a primitive value on the stack to its wrapper type."""
+        desc = primitive_type.descriptor()
+        if desc not in BOXING_MAP:
+            raise CompileError(f"Cannot box type: {primitive_type}")
+        wrapper_class, valueof_desc, _, _ = BOXING_MAP[desc]
+        builder.invokestatic(wrapper_class, "valueOf", valueof_desc, primitive_type.size, 1)
+        return ClassJType(wrapper_class)
+
+    def emit_unboxing(self, wrapper_type: ClassJType, builder: BytecodeBuilder) -> JType:
+        """Unbox a wrapper value on the stack to its primitive type."""
+        internal_name = wrapper_type.internal_name()
+        if internal_name not in UNBOXING_MAP:
+            raise CompileError(f"Cannot unbox type: {wrapper_type}")
+        prim_desc = UNBOXING_MAP[internal_name]
+        wrapper_class, _, unbox_method, unbox_desc = BOXING_MAP[prim_desc]
+        from .types import PRIMITIVE_BY_DESCRIPTOR
+        prim_type = PRIMITIVE_BY_DESCRIPTOR[prim_desc]
+        builder.invokevirtual(wrapper_class, unbox_method, unbox_desc, 0, prim_type.size)
+        return prim_type
+
+    def needs_boxing(self, source_type: JType, target_type: JType) -> bool:
+        """Check if we need to box source_type to target_type."""
+        if not isinstance(source_type, PrimitiveJType):
+            return False
+        if not isinstance(target_type, ClassJType):
+            return False
+        prim_desc = source_type.descriptor()
+        if prim_desc not in BOXING_MAP:
+            return False
+        wrapper_class = BOXING_MAP[prim_desc][0]
+        return target_type.internal_name() == wrapper_class
+
+    def needs_unboxing(self, source_type: JType, target_type: JType) -> bool:
+        """Check if we need to unbox source_type to target_type."""
+        if not isinstance(source_type, ClassJType):
+            return False
+        if not isinstance(target_type, PrimitiveJType):
+            return False
+        internal_name = source_type.internal_name()
+        if internal_name not in UNBOXING_MAP:
+            return False
+        prim_desc = UNBOXING_MAP[internal_name]
+        return target_type.descriptor() == prim_desc
+
+    def emit_conversion(self, source_type: JType, target_type: JType, builder: BytecodeBuilder) -> JType:
+        """Emit code to convert source_type to target_type if needed."""
+        if self.needs_boxing(source_type, target_type):
+            return self.emit_boxing(source_type, builder)
+        elif self.needs_unboxing(source_type, target_type):
+            return self.emit_unboxing(source_type, builder)
+        return source_type
 
     def resolve_type(self, t: ast.Type) -> JType:
         """Resolve an AST type to a JType."""

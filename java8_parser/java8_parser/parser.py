@@ -1179,23 +1179,26 @@ class Java8Transformer(Transformer):
     def catch_clause(self, items):
         modifiers = ()
         types = ()
-        name = None
+        name = ""
         body = None
 
         for item in items:
-            if isinstance(item, tuple) and item and isinstance(item[0], ast.Modifier):
-                modifiers = item
-            elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
-                types = item
-            elif isinstance(item, Token) and item.type == "IDENTIFIER":
-                name = str(item)
+            # catch_formal_parameter returns (modifiers, types, name)
+            if isinstance(item, tuple) and len(item) == 3:
+                param_modifiers, param_types, param_name = item
+                if isinstance(param_modifiers, tuple) and (not param_modifiers or isinstance(param_modifiers[0], ast.Modifier)):
+                    modifiers = param_modifiers
+                if isinstance(param_types, tuple) and param_types and isinstance(param_types[0], ast.Type):
+                    types = param_types
+                if param_name:
+                    name = param_name
             elif isinstance(item, ast.Block):
                 body = item
 
         return ast.CatchClause(
             modifiers=modifiers,
             types=types,
-            name=name or "",
+            name=name,
             body=body or ast.Block(statements=())
         )
 
@@ -1209,6 +1212,9 @@ class Java8Transformer(Transformer):
                 modifiers.append(item)
             elif isinstance(item, ast.Type):
                 types.append(item)
+            elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
+                # catch_type returns a tuple of types
+                types.extend(item)
             elif isinstance(item, Token) and item.type == "IDENTIFIER":
                 name = str(item)
 
@@ -1437,7 +1443,7 @@ class Java8Transformer(Transformer):
                 result = ast.InstanceOfExpression(expression=result, type=item)
                 pending_op = None
             # Check Token before str since Token is a str subclass
-            elif isinstance(item, Token) and str(item) in {"<", ">", "<=", ">="}:
+            elif isinstance(item, Token) and (str(item) in {"<", ">", "<=", ">="} or item.type == 'INSTANCEOF'):
                 pending_op = str(item)
             elif isinstance(item, str) and item in {"<", ">", "<=", ">=", "instanceof"}:
                 pending_op = item

@@ -419,12 +419,21 @@ def write_annotations_attribute(cp: ConstantPool, out: bytearray,
 
 
 @dataclass
+class ExceptionTableEntry:
+    """An entry in the exception table."""
+    start_pc: int
+    end_pc: int
+    handler_pc: int
+    catch_type: int  # 0 for finally (catches all), otherwise constant pool index of class
+
+
+@dataclass
 class CodeAttribute:
     """Code attribute for a method."""
     max_stack: int = 0
     max_locals: int = 0
     code: bytearray = field(default_factory=bytearray)
-    exception_table: list = field(default_factory=list)
+    exception_table: list[ExceptionTableEntry] = field(default_factory=list)
     attributes: list = field(default_factory=list)
 
     def write(self, cp: ConstantPool, out: bytearray):
@@ -436,7 +445,9 @@ class CodeAttribute:
         data.extend(struct.pack(">I", len(self.code)))
         data.extend(self.code)
         data.extend(struct.pack(">H", len(self.exception_table)))
-        # Exception table entries would go here
+        for entry in self.exception_table:
+            data.extend(struct.pack(">HHHH",
+                entry.start_pc, entry.end_pc, entry.handler_pc, entry.catch_type))
         data.extend(struct.pack(">H", len(self.attributes)))
         # Sub-attributes would go here
 
@@ -680,6 +691,7 @@ class BytecodeBuilder:
         self._current_stack = 0
         self._labels: dict[str, int] = {}
         self._forward_refs: list[tuple[str, int, int]] = []  # (label, offset, size)
+        self._exception_handlers: list[tuple[str, str, str, int]] = []  # (start, end, handler, catch_type_idx)
 
     def _push(self, count: int = 1):
         self._current_stack += count
@@ -1147,6 +1159,114 @@ class BytecodeBuilder:
         self._pop()
         self._push()
 
+    def newarray(self, atype: int):
+        """Create new primitive array. atype: T_BOOLEAN=4, T_CHAR=5, T_FLOAT=6, T_DOUBLE=7, T_BYTE=8, T_SHORT=9, T_INT=10, T_LONG=11"""
+        self._emit(Opcode.NEWARRAY, atype)
+        self._pop()  # pop count
+        self._push()  # push array ref
+
+    def anewarray(self, class_name: str):
+        """Create new reference type array."""
+        idx = self.cp.add_class(class_name)
+        self._emit(Opcode.ANEWARRAY)
+        self.code.extend(struct.pack(">H", idx))
+        self._pop()  # pop count
+        self._push()  # push array ref
+
+    def iaload(self):
+        """Load int from array."""
+        self._emit(Opcode.IALOAD)
+        self._pop(2)  # pop arrayref, index
+        self._push()  # push value
+
+    def laload(self):
+        """Load long from array."""
+        self._emit(Opcode.LALOAD)
+        self._pop(2)
+        self._push(2)
+
+    def faload(self):
+        """Load float from array."""
+        self._emit(Opcode.FALOAD)
+        self._pop(2)
+        self._push()
+
+    def daload(self):
+        """Load double from array."""
+        self._emit(Opcode.DALOAD)
+        self._pop(2)
+        self._push(2)
+
+    def aaload(self):
+        """Load reference from array."""
+        self._emit(Opcode.AALOAD)
+        self._pop(2)
+        self._push()
+
+    def baload(self):
+        """Load byte/boolean from array."""
+        self._emit(Opcode.BALOAD)
+        self._pop(2)
+        self._push()
+
+    def caload(self):
+        """Load char from array."""
+        self._emit(Opcode.CALOAD)
+        self._pop(2)
+        self._push()
+
+    def saload(self):
+        """Load short from array."""
+        self._emit(Opcode.SALOAD)
+        self._pop(2)
+        self._push()
+
+    def iastore(self):
+        """Store int to array."""
+        self._emit(Opcode.IASTORE)
+        self._pop(3)  # pop arrayref, index, value
+
+    def lastore(self):
+        """Store long to array."""
+        self._emit(Opcode.LASTORE)
+        self._pop(4)  # pop arrayref, index, value (2 slots)
+
+    def fastore(self):
+        """Store float to array."""
+        self._emit(Opcode.FASTORE)
+        self._pop(3)
+
+    def dastore(self):
+        """Store double to array."""
+        self._emit(Opcode.DASTORE)
+        self._pop(4)  # arrayref, index, value (2 slots)
+
+    def aastore(self):
+        """Store reference to array."""
+        self._emit(Opcode.AASTORE)
+        self._pop(3)
+
+    def bastore(self):
+        """Store byte/boolean to array."""
+        self._emit(Opcode.BASTORE)
+        self._pop(3)
+
+    def castore(self):
+        """Store char to array."""
+        self._emit(Opcode.CASTORE)
+        self._pop(3)
+
+    def sastore(self):
+        """Store short to array."""
+        self._emit(Opcode.SASTORE)
+        self._pop(3)
+
+    def arraylength(self):
+        """Get array length."""
+        self._emit(Opcode.ARRAYLENGTH)
+        self._pop()  # pop arrayref
+        self._push()  # push length
+
     def goto(self, label: str):
         self._emit(Opcode.GOTO)
         self._forward_refs.append((label, self.position(), 2))
@@ -1244,17 +1364,94 @@ class BytecodeBuilder:
         self._emit(Opcode.DUP)
         self._push()
 
+    def dup_x1(self):
+        """Duplicate the top operand stack value and insert two values down."""
+        self._emit(Opcode.DUP_X1)
+        self._push()
+
+    def dup_x2(self):
+        """Duplicate the top operand stack value and insert three values down."""
+        self._emit(Opcode.DUP_X2)
+        self._push()
+
+    def dup2(self):
+        """Duplicate the top one or two operand stack values."""
+        self._emit(Opcode.DUP2)
+        self._push(2)
+
+    def dup2_x1(self):
+        """Duplicate top two values and insert three values down."""
+        self._emit(Opcode.DUP2_X1)
+        self._push(2)
+
+    def dup2_x2(self):
+        """Duplicate top two values and insert four values down."""
+        self._emit(Opcode.DUP2_X2)
+        self._push(2)
+
     def pop(self):
         self._emit(Opcode.POP)
         self._pop()
 
+    def athrow(self):
+        """Throw exception (objectref must be on stack)."""
+        self._emit(Opcode.ATHROW)
+        self._pop()
+
+    def lookupswitch(self, default_label: str, cases: list[tuple[int, str]]):
+        """Emit a lookupswitch instruction.
+
+        Args:
+            default_label: Label for default case
+            cases: List of (match_value, label) pairs, sorted by match value
+        """
+        self._emit(Opcode.LOOKUPSWITCH)
+
+        # Padding to 4-byte alignment
+        base = len(self.code)
+        padding = (4 - (base % 4)) % 4
+        for _ in range(padding):
+            self.code.append(0)
+
+        # Default offset (will be patched)
+        self._forward_refs.append((default_label, len(self.code), 4, base - 1))
+        self.code.extend(struct.pack(">i", 0))
+
+        # npairs
+        npairs = len(cases)
+        self.code.extend(struct.pack(">i", npairs))
+
+        # Match-offset pairs (must be sorted by match value)
+        sorted_cases = sorted(cases, key=lambda x: x[0])
+        for match, label in sorted_cases:
+            self.code.extend(struct.pack(">i", match))
+            self._forward_refs.append((label, len(self.code), 4, base - 1))
+            self.code.extend(struct.pack(">i", 0))
+
+        self._pop()  # Pop the switch expression value
+
+    def add_exception_handler(self, start_label: str, end_label: str, handler_label: str, catch_type_idx: int):
+        """Add an exception handler entry.
+
+        Args:
+            start_label: Label marking start of try block (inclusive)
+            end_label: Label marking end of try block (exclusive)
+            handler_label: Label marking start of catch handler
+            catch_type_idx: Constant pool index of exception class (0 for finally/catch-all)
+        """
+        self._exception_handlers.append((start_label, end_label, handler_label, catch_type_idx))
+
     def resolve_labels(self):
-        for label, offset, size in self._forward_refs:
+        for ref in self._forward_refs:
+            if len(ref) == 3:
+                label, offset, size = ref
+                instr_start = offset - 1  # The byte before the offset is the opcode
+            else:
+                label, offset, size, instr_start = ref  # For lookupswitch/tableswitch
+
             if label not in self._labels:
                 raise ValueError(f"Undefined label: {label}")
             target = self._labels[label]
-            # Calculate relative offset (from instruction start, which is offset - 3 for 2-byte branches)
-            instr_start = offset - 1  # The byte before the offset is the opcode
             relative = target - instr_start
             if size == 2:
                 struct.pack_into(">h", self.code, offset, relative)
@@ -1263,8 +1460,27 @@ class BytecodeBuilder:
 
     def build(self) -> CodeAttribute:
         self.resolve_labels()
+
+        # Build exception table from handler entries
+        exception_table = []
+        for start_label, end_label, handler_label, catch_type_idx in self._exception_handlers:
+            if start_label not in self._labels:
+                raise ValueError(f"Undefined exception handler start label: {start_label}")
+            if end_label not in self._labels:
+                raise ValueError(f"Undefined exception handler end label: {end_label}")
+            if handler_label not in self._labels:
+                raise ValueError(f"Undefined exception handler label: {handler_label}")
+
+            exception_table.append(ExceptionTableEntry(
+                start_pc=self._labels[start_label],
+                end_pc=self._labels[end_label],
+                handler_pc=self._labels[handler_label],
+                catch_type=catch_type_idx,
+            ))
+
         return CodeAttribute(
             max_stack=self.max_stack,
             max_locals=self.max_locals,
             code=self.code,
+            exception_table=exception_table,
         )

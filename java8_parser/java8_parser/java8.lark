@@ -17,7 +17,7 @@ package_declaration: annotation* "package" qualified_name ";"
 
 import_declaration: "import" STATIC? qualified_name ("." STAR)? ";"
 
-STATIC: "static"
+STATIC.2: "static"
 STAR: "*"
 
 type_declaration: class_declaration
@@ -222,9 +222,9 @@ exception_type_list: class_type ("," class_type)*
 
 block: "{" block_statement* "}"
 
-block_statement: local_variable_declaration ";"
+block_statement: statement
+               | local_variable_declaration ";"
                | class_declaration
-               | statement
                | explicit_constructor_invocation
 
 explicit_constructor_invocation: type_arguments? "this" "(" argument_list? ")" ";"
@@ -329,7 +329,7 @@ break_statement: "break" IDENTIFIER? ";"
 
 continue_statement: "continue" IDENTIFIER? ";"
 
-return_statement: "return" expression? ";"
+return_statement: RETURN expression? ";"
 
 throw_statement: "throw" expression ";"
 
@@ -415,7 +415,7 @@ relational_expression: shift_expression
                      | relational_expression GT shift_expression
                      | relational_expression LE shift_expression
                      | relational_expression GE shift_expression
-                     | relational_expression "instanceof" reference_type
+                     | relational_expression INSTANCEOF reference_type
 
 shift_expression: additive_expression
                 | shift_expression LSHIFT additive_expression
@@ -610,6 +610,9 @@ CARET: "^"
 AMPAMP: "&&"
 PIPEPIPE: "||"
 
+// instanceof keyword
+INSTANCEOF.2: "instanceof"
+
 // Unary operators
 BANG: "!"
 TILDE: "~"
@@ -630,29 +633,33 @@ URSHIFT_ASSIGN: ">>>="
 
 // ==================== MODIFIER KEYWORDS ====================
 
-PUBLIC: "public"
-PROTECTED: "protected"
-PRIVATE: "private"
+PUBLIC.2: "public"
+PROTECTED.2: "protected"
+PRIVATE.2: "private"
 // STATIC is already defined above for imports
-ABSTRACT: "abstract"
-FINAL: "final"
-NATIVE: "native"
-SYNCHRONIZED: "synchronized"
-TRANSIENT: "transient"
-VOLATILE: "volatile"
-STRICTFP: "strictfp"
-DEFAULT: "default"
+ABSTRACT.2: "abstract"
+FINAL.2: "final"
+NATIVE.2: "native"
+SYNCHRONIZED.2: "synchronized"
+TRANSIENT.2: "transient"
+VOLATILE.2: "volatile"
+STRICTFP.2: "strictfp"
+DEFAULT.2: "default"
+
+// ==================== STATEMENT KEYWORDS ====================
+
+RETURN.2: "return"
 
 // ==================== PRIMITIVE TYPE KEYWORDS ====================
 
-BYTE: "byte"
-SHORT: "short"
-INT: "int"
-LONG: "long"
-CHAR: "char"
-FLOAT: "float"
-DOUBLE: "double"
-BOOLEAN: "boolean"
+BYTE.2: "byte"
+SHORT.2: "short"
+INT.2: "int"
+LONG.2: "long"
+CHAR.2: "char"
+FLOAT.2: "float"
+DOUBLE.2: "double"
+BOOLEAN.2: "boolean"
 
 // ==================== WHITESPACE AND COMMENTS ====================
 
