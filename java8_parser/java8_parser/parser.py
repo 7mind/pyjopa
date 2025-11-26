@@ -9,7 +9,7 @@ from lark import Lark, Transformer, v_args, Token, Tree
 from typing import Optional
 from . import ast
 
-sys.setrecursionlimit(50000)
+sys.setrecursionlimit(100000)
 
 
 GRAMMAR_FILE = Path(__file__).parent / "java8.lark"
