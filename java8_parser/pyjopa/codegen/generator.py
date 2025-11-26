@@ -245,6 +245,10 @@ class CodeGenerator(
         param_types = [self._resolve_parameter_type(p) for p in ctor.parameters]
         descriptor = "(" + "".join(t.descriptor() for t in param_types) + ")V"
 
+        # Collect parameter names and annotations for reflection
+        parameter_names = [p.name for p in ctor.parameters]
+        parameter_annotations = [self._convert_annotations(p.modifiers) for p in ctor.parameters]
+
         builder = BytecodeBuilder(self.class_file.cp)
         ctx = MethodContext(
             class_name=self.class_name,
@@ -274,7 +278,9 @@ class CodeGenerator(
             access_flags=flags,
             name="<init>",
             descriptor=descriptor,
-            code=builder.build()
+            code=builder.build(),
+            parameter_names=parameter_names,
+            parameter_annotations=parameter_annotations,
         )
         self.class_file.add_method(method_info)
 
@@ -315,6 +321,10 @@ class CodeGenerator(
         throws_list = [self._resolve_class_name(t.name) if isinstance(t, ast.ClassType) else str(t)
                        for t in method.throws]
 
+        # Collect parameter names and annotations for reflection
+        parameter_names = [p.name for p in method.parameters]
+        parameter_annotations = [self._convert_annotations(p.modifiers) for p in method.parameters]
+
         # Abstract/native methods have no code
         if method.body is None:
             method_info = MethodInfo(
@@ -323,7 +333,9 @@ class CodeGenerator(
                 descriptor=descriptor,
                 code=None,
                 annotations=annotations,
-                exceptions=throws_list
+                exceptions=throws_list,
+                parameter_names=parameter_names,
+                parameter_annotations=parameter_annotations,
             )
             self.class_file.add_method(method_info)
             return
@@ -357,7 +369,9 @@ class CodeGenerator(
             descriptor=descriptor,
             code=builder.build(),
             annotations=annotations,
-            exceptions=throws_list
+            exceptions=throws_list,
+            parameter_names=parameter_names,
+            parameter_annotations=parameter_annotations,
         )
         self.class_file.add_method(method_info)
 

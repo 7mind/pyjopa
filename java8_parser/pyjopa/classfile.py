@@ -418,6 +418,45 @@ def write_annotations_attribute(cp: ConstantPool, out: bytearray,
     out.extend(data)
 
 
+def write_method_parameters_attribute(cp: ConstantPool, out: bytearray,
+                                      parameter_names: list[str], parameter_flags: list[int] = None):
+    """Write a MethodParameters attribute for reflection."""
+    if not parameter_names:
+        return
+    attr_name_idx = cp.add_utf8("MethodParameters")
+    data = bytearray()
+    data.append(len(parameter_names))  # parameters_count (u1)
+    for i, name in enumerate(parameter_names):
+        name_idx = cp.add_utf8(name) if name else 0
+        flags = parameter_flags[i] if parameter_flags else 0
+        data.extend(struct.pack(">H", name_idx))
+        data.extend(struct.pack(">H", flags))
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", len(data)))
+    out.extend(data)
+
+
+def write_parameter_annotations_attribute(cp: ConstantPool, out: bytearray,
+                                          attr_name: str, param_annotations: list[list[AnnotationInfo]]):
+    """Write RuntimeVisibleParameterAnnotations or RuntimeInvisibleParameterAnnotations."""
+    if not param_annotations:
+        return
+    # Check if there are any annotations at all
+    has_any = any(anns for anns in param_annotations)
+    if not has_any:
+        return
+    attr_name_idx = cp.add_utf8(attr_name)
+    data = bytearray()
+    data.append(len(param_annotations))  # num_parameters (u1)
+    for anns in param_annotations:
+        data.extend(struct.pack(">H", len(anns)))  # num_annotations
+        for ann in anns:
+            ann.write(cp, data)
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", len(data)))
+    out.extend(data)
+
+
 @dataclass
 class ExceptionTableEntry:
     """An entry in the exception table."""
@@ -466,6 +505,8 @@ class MethodInfo:
     signature: Optional[str] = None
     annotations: list = field(default_factory=list)
     exceptions: list = field(default_factory=list)
+    parameter_names: list = field(default_factory=list)
+    parameter_annotations: list = field(default_factory=list)
 
     def write(self, cp: ConstantPool, out: bytearray):
         name_idx = cp.add_utf8(self.name)
@@ -484,6 +525,10 @@ class MethodInfo:
             attr_count += 1
         if self.exceptions:
             attr_count += 1
+        if self.parameter_names:
+            attr_count += 1
+        if self.parameter_annotations and any(self.parameter_annotations):
+            attr_count += 1
 
         out.extend(struct.pack(">H", attr_count))
         if self.code:
@@ -494,6 +539,11 @@ class MethodInfo:
             write_annotations_attribute(cp, out, "RuntimeVisibleAnnotations", self.annotations)
         if self.exceptions:
             _write_exceptions_attribute(cp, out, self.exceptions)
+        if self.parameter_names:
+            write_method_parameters_attribute(cp, out, self.parameter_names)
+        if self.parameter_annotations and any(self.parameter_annotations):
+            write_parameter_annotations_attribute(
+                cp, out, "RuntimeVisibleParameterAnnotations", self.parameter_annotations)
 
 
 @dataclass
@@ -627,6 +677,27 @@ class ClassFile:
             for method in self.methods:
                 for exc in method.exceptions:
                     self.cp.add_class(exc)
+
+        # Pre-add "MethodParameters" attribute name and parameter names
+        has_method_params = any(m.parameter_names for m in self.methods)
+        if has_method_params:
+            self.cp.add_utf8("MethodParameters")
+            for method in self.methods:
+                for name in method.parameter_names:
+                    if name:
+                        self.cp.add_utf8(name)
+
+        # Pre-add "RuntimeVisibleParameterAnnotations" attribute name
+        has_param_annotations = any(
+            any(anns for anns in m.parameter_annotations)
+            for m in self.methods if m.parameter_annotations
+        )
+        if has_param_annotations:
+            self.cp.add_utf8("RuntimeVisibleParameterAnnotations")
+            for method in self.methods:
+                for param_anns in method.parameter_annotations:
+                    for ann in param_anns:
+                        self.cp.add_utf8(ann.type_descriptor)
 
         # Magic number
         out.extend(struct.pack(">I", self.MAGIC))
