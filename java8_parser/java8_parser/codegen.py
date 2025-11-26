@@ -1101,6 +1101,17 @@ class CodeGenerator:
         elif isinstance(expr, ast.CastExpression):
             return self.compile_cast(expr, ctx)
 
+        elif isinstance(expr, ast.InstanceOfExpression):
+            self.compile_expression(expr.expression, ctx)
+            target_type = self.resolve_type(expr.type)
+            if isinstance(target_type, ClassJType):
+                builder.instanceof_(target_type.internal_name())
+            elif isinstance(target_type, ArrayJType):
+                builder.instanceof_(target_type.descriptor())
+            else:
+                raise CompileError(f"Invalid instanceof type: {target_type}")
+            return BOOLEAN
+
         else:
             raise CompileError(f"Unsupported expression type: {type(expr).__name__}")
 
