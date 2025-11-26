@@ -1,6 +1,8 @@
-# pyjopa - Python Java Parser and Compiler
+# PyJOPA: Javac One Patch Away (in Python).
 
 A complete Java 8 parser and bytecode compiler written in Python using the Lark parsing library.
+
+Totally Claude'd. Sister project: [JOPA](https://github.com/7mind/jopa)
 
 ## Features
 
