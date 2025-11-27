@@ -322,6 +322,25 @@ class ConstantPool:
         nat_idx = self.add_name_and_type(method_name, descriptor)
         return self._add((ConstantPoolTag.INTERFACE_METHODREF, class_idx, nat_idx))
 
+    def add_method_handle(self, reference_kind: int, reference_index: int) -> int:
+        """Add a CONSTANT_MethodHandle entry.
+        reference_kind: 1-9 (REF_getField, REF_getStatic, REF_putField, REF_putStatic,
+                             REF_invokeVirtual, REF_invokeStatic, REF_invokeSpecial,
+                             REF_newInvokeSpecial, REF_invokeInterface)
+        reference_index: index to CONSTANT_Fieldref, CONSTANT_Methodref, or CONSTANT_InterfaceMethodref
+        """
+        return self._add((ConstantPoolTag.METHOD_HANDLE, reference_kind, reference_index))
+
+    def add_method_type(self, descriptor: str) -> int:
+        """Add a CONSTANT_MethodType entry."""
+        descriptor_index = self.add_utf8(descriptor)
+        return self._add((ConstantPoolTag.METHOD_TYPE, descriptor_index))
+
+    def add_invoke_dynamic(self, bootstrap_method_attr_index: int, name: str, descriptor: str) -> int:
+        """Add a CONSTANT_InvokeDynamic entry."""
+        nat_idx = self.add_name_and_type(name, descriptor)
+        return self._add((ConstantPoolTag.INVOKE_DYNAMIC, bootstrap_method_attr_index, nat_idx))
+
     def write(self, out: bytearray):
         out.extend(struct.pack(">H", len(self._entries)))
         for entry in self._entries[1:]:
@@ -349,6 +368,16 @@ class ConstantPool:
                 out.extend(struct.pack(">HH", entry[1], entry[2]))
             elif tag in (ConstantPoolTag.FIELDREF, ConstantPoolTag.METHODREF,
                          ConstantPoolTag.INTERFACE_METHODREF):
+                out.extend(struct.pack(">HH", entry[1], entry[2]))
+            elif tag == ConstantPoolTag.METHOD_HANDLE:
+                # reference_kind (u1), reference_index (u2)
+                out.append(entry[1])
+                out.extend(struct.pack(">H", entry[2]))
+            elif tag == ConstantPoolTag.METHOD_TYPE:
+                # descriptor_index (u2)
+                out.extend(struct.pack(">H", entry[1]))
+            elif tag == ConstantPoolTag.INVOKE_DYNAMIC:
+                # bootstrap_method_attr_index (u2), name_and_type_index (u2)
                 out.extend(struct.pack(">HH", entry[1], entry[2]))
 
 
@@ -633,13 +662,20 @@ class InnerClassInfo:
     access_flags: int  # Access flags for the inner class
 
 
+@dataclass
+class BootstrapMethod:
+    """Represents a bootstrap method entry for invokedynamic."""
+    method_handle_index: int  # Index to CONSTANT_MethodHandle in constant pool
+    arguments: list[int] = field(default_factory=list)  # Indices to constant pool entries
+
+
 class ClassFile:
     """Represents a Java class file."""
 
     MAGIC = 0xCAFEBABE
 
     def __init__(self, name: str, super_class: str = "java/lang/Object",
-                 version: tuple[int, int] = ClassFileVersion.JAVA_6):
+                 version: tuple[int, int] = ClassFileVersion.JAVA_8):
         self.version = version
         self.access_flags = AccessFlags.PUBLIC | AccessFlags.SUPER
         self.name = name
@@ -651,6 +687,15 @@ class ClassFile:
         self.signature: Optional[str] = None
         self.annotations: list[AnnotationInfo] = []
         self.inner_classes: list[InnerClassInfo] = []
+        self.bootstrap_methods: list[BootstrapMethod] = []
+
+    def add_bootstrap_method(self, method_handle_index: int, arguments: list[int] = None) -> int:
+        """Add a bootstrap method and return its index in the bootstrap_methods table."""
+        if arguments is None:
+            arguments = []
+        bootstrap_method = BootstrapMethod(method_handle_index, arguments)
+        self.bootstrap_methods.append(bootstrap_method)
+        return len(self.bootstrap_methods) - 1
 
     def add_method(self, method: MethodInfo):
         self.methods.append(method)
@@ -758,6 +803,10 @@ class ClassFile:
                 if ic.inner_name:
                     self.cp.add_utf8(ic.inner_name)
 
+        # Pre-add "BootstrapMethods" attribute name
+        if self.bootstrap_methods:
+            self.cp.add_utf8("BootstrapMethods")
+
         # Magic number
         out.extend(struct.pack(">I", self.MAGIC))
 
@@ -799,6 +848,8 @@ class ClassFile:
             attr_count += 1
         if self.inner_classes:
             attr_count += 1
+        if self.bootstrap_methods:
+            attr_count += 1
         out.extend(struct.pack(">H", attr_count))
         if self.signature:
             _write_signature_attribute(self.cp, out, self.signature)
@@ -806,6 +857,8 @@ class ClassFile:
             write_annotations_attribute(self.cp, out, "RuntimeVisibleAnnotations", self.annotations)
         if self.inner_classes:
             self._write_inner_classes_attribute(self.cp, out)
+        if self.bootstrap_methods:
+            self._write_bootstrap_methods_attribute(self.cp, out)
 
         return bytes(out)
 
@@ -831,6 +884,30 @@ class ClassFile:
             out.extend(struct.pack(">H", outer_class_idx))
             out.extend(struct.pack(">H", inner_name_idx))
             out.extend(struct.pack(">H", ic.access_flags))
+
+    def _write_bootstrap_methods_attribute(self, cp: ConstantPool, out: bytearray):
+        """Write the BootstrapMethods attribute."""
+        attr_name_idx = cp.add_utf8("BootstrapMethods")
+        out.extend(struct.pack(">H", attr_name_idx))
+
+        # Calculate attribute length
+        attr_len = 2  # number_of_bootstrap_methods (u2)
+        for bm in self.bootstrap_methods:
+            attr_len += 2  # bootstrap_method_ref (u2)
+            attr_len += 2  # num_bootstrap_arguments (u2)
+            attr_len += 2 * len(bm.arguments)  # bootstrap_arguments (u2 each)
+
+        out.extend(struct.pack(">I", attr_len))
+
+        # Number of bootstrap methods
+        out.extend(struct.pack(">H", len(self.bootstrap_methods)))
+
+        # Write each bootstrap method entry
+        for bm in self.bootstrap_methods:
+            out.extend(struct.pack(">H", bm.method_handle_index))
+            out.extend(struct.pack(">H", len(bm.arguments)))
+            for arg_idx in bm.arguments:
+                out.extend(struct.pack(">H", arg_idx))
 
     def write(self, path: str):
         with open(path, "wb") as f:
@@ -1543,6 +1620,23 @@ class BytecodeBuilder:
         self._emit(Opcode.INVOKEINTERFACE)
         self.code.extend(struct.pack(">H", idx))
         self.code.append(arg_size)  # count (includes 'this')
+        self.code.append(0)  # reserved, must be zero
+        self._pop(arg_size)
+        self._push(ret_size)
+
+    def invokedynamic(self, bootstrap_method_index: int, name: str, descriptor: str,
+                      arg_size: int, ret_size: int):
+        """Emit invokedynamic instruction.
+        bootstrap_method_index: index into the BootstrapMethods attribute table
+        name: method name
+        descriptor: method descriptor
+        arg_size: number of stack slots consumed by arguments
+        ret_size: number of stack slots produced by return value
+        """
+        idx = self.cp.add_invoke_dynamic(bootstrap_method_index, name, descriptor)
+        self._emit(Opcode.INVOKEDYNAMIC)
+        self.code.extend(struct.pack(">H", idx))
+        self.code.append(0)  # reserved, must be zero
         self.code.append(0)  # reserved, must be zero
         self._pop(arg_size)
         self._push(ret_size)

@@ -127,6 +127,9 @@ class ExpressionCompilerMixin:
         elif isinstance(expr, ast.ArrayInitializer):
             raise CompileError("ArrayInitializer must be part of NewArray or variable declaration")
 
+        elif isinstance(expr, ast.LambdaExpression):
+            return self.compile_lambda(expr, ctx)
+
         else:
             raise CompileError(f"Unsupported expression type: {type(expr).__name__}")
 

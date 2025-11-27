@@ -25,6 +25,7 @@ from .statements import StatementCompilerMixin
 from .expressions import ExpressionCompilerMixin
 from .arrays import ArrayCompilerMixin
 from .boxing import BoxingMixin
+from .lambdas import LambdaCompilerMixin
 
 
 class CodeGenerator(
@@ -34,6 +35,7 @@ class CodeGenerator(
     ExpressionCompilerMixin,
     ArrayCompilerMixin,
     BoxingMixin,
+    LambdaCompilerMixin,
 ):
     """Generates bytecode from AST."""
 
@@ -42,6 +44,7 @@ class CodeGenerator(
         self.class_name: str = ""
         self.super_class_name: str = "java/lang/Object"
         self._label_counter = 0
+        self._lambda_counter = 0
         self.classpath = classpath
         self._class_cache: dict[str, ReadClassInfo] = {}
         self._local_methods: dict[str, list[LocalMethodInfo]] = {}  # method_name -> list of overloads
