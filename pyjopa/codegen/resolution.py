@@ -186,20 +186,54 @@ class ResolutionMixin:
                 if method.name != method_name:
                     continue
                 return_type, param_types = self._parse_method_descriptor(method.descriptor)
-                if len(param_types) != len(arg_types):
-                    continue
-                # Check type compatibility
-                if self._args_compatible(arg_types, param_types):
-                    is_static = (method.access_flags & AccessFlags.STATIC) != 0
-                    candidates.append(ResolvedMethod(
-                        owner=current.name,
-                        name=method_name,
-                        descriptor=method.descriptor,
-                        is_static=is_static,
-                        is_interface=is_interface,
-                        return_type=return_type,
-                        param_types=param_types,
-                    ))
+                is_static = (method.access_flags & AccessFlags.STATIC) != 0
+                is_varargs = (method.access_flags & AccessFlags.VARARGS) != 0
+
+                # Exact match
+                if len(param_types) == len(arg_types):
+                    # Check type compatibility
+                    if self._args_compatible(arg_types, param_types):
+                        candidates.append(ResolvedMethod(
+                            owner=current.name,
+                            name=method_name,
+                            descriptor=method.descriptor,
+                            is_static=is_static,
+                            is_interface=is_interface,
+                            return_type=return_type,
+                            param_types=param_types,
+                            is_varargs=is_varargs,
+                        ))
+                # Varargs match
+                elif is_varargs and param_types:
+                    num_regular_params = len(param_types) - 1
+                    if len(arg_types) >= num_regular_params:
+                        # Check regular params
+                        regular_match = True
+                        for i in range(num_regular_params):
+                            if not self._type_assignable(arg_types[i], param_types[i]):
+                                regular_match = False
+                                break
+                        if regular_match:
+                            # Check varargs elements against array element type
+                            varargs_param = param_types[-1]
+                            if isinstance(varargs_param, ArrayJType):
+                                elem_type = varargs_param.element_type
+                                varargs_match = True
+                                for i in range(num_regular_params, len(arg_types)):
+                                    if not self._type_assignable(arg_types[i], elem_type):
+                                        varargs_match = False
+                                        break
+                                if varargs_match:
+                                    candidates.append(ResolvedMethod(
+                                        owner=current.name,
+                                        name=method_name,
+                                        descriptor=method.descriptor,
+                                        is_static=is_static,
+                                        is_interface=is_interface,
+                                        return_type=return_type,
+                                        param_types=param_types,
+                                        is_varargs=True,
+                                    ))
             if current.super_class:
                 current = self._lookup_class(current.super_class)
             else:
@@ -409,21 +443,76 @@ class ResolutionMixin:
 
     def _find_constructor(self, class_name: str, arg_types: list[JType]) -> Optional[ResolvedMethod]:
         """Find a constructor in the given class matching the argument types."""
+        # Check if we're looking for a constructor in the class currently being compiled
+        if hasattr(self, 'class_name') and class_name == self.class_name and hasattr(self, '_local_methods'):
+            # Look in registered constructors first
+            if "<init>" in self._local_methods:
+                candidates = []
+                for local_ctor in self._local_methods["<init>"]:
+                    param_types = local_ctor.param_types
+                    if len(param_types) == len(arg_types):
+                        if self._args_compatible(arg_types, list(param_types)):
+                            param_descs = "".join(t.descriptor() for t in param_types)
+                            descriptor = f"({param_descs})V"
+                            candidates.append(ResolvedMethod(
+                                owner=class_name,
+                                name="<init>",
+                                descriptor=descriptor,
+                                is_static=False,
+                                is_interface=False,
+                                return_type=VOID,
+                                param_types=param_types,
+                                is_varargs=local_ctor.is_varargs,
+                            ))
+                    elif local_ctor.is_varargs and param_types:
+                        num_regular = len(param_types) - 1
+                        if len(arg_types) >= num_regular:
+                            regular_match = all(
+                                self._type_assignable(arg_types[i], param_types[i])
+                                for i in range(num_regular)
+                            )
+                            if regular_match:
+                                varargs_param = param_types[-1]
+                                if isinstance(varargs_param, ArrayJType):
+                                    elem_type = varargs_param.element_type
+                                    varargs_match = all(
+                                        self._type_assignable(arg_types[i], elem_type)
+                                        for i in range(num_regular, len(arg_types))
+                                    )
+                                    if varargs_match:
+                                        param_descs = "".join(t.descriptor() for t in param_types)
+                                        descriptor = f"({param_descs})V"
+                                        candidates.append(ResolvedMethod(
+                                            owner=class_name,
+                                            name="<init>",
+                                            descriptor=descriptor,
+                                            is_static=False,
+                                            is_interface=False,
+                                            return_type=VOID,
+                                            param_types=param_types,
+                                            is_varargs=True,
+                                        ))
+                if candidates:
+                    return self._most_specific_method(candidates, arg_types)
+            return None
+
+        # Look up the class from compiled classes
         cls = self._lookup_class(class_name)
         if not cls:
             return None
-
-        candidates = []
+        cls_methods = cls.methods
         is_interface = (cls.access_flags & AccessFlags.INTERFACE) != 0
 
-        for method in cls.methods:
+        candidates = []
+
+        for method in cls_methods:
             if method.name != "<init>":
                 continue
             return_type, param_types = self._parse_method_descriptor(method.descriptor)
             if len(param_types) == len(arg_types):
                 if self._args_compatible(arg_types, param_types):
                     candidates.append(ResolvedMethod(
-                        owner=cls.name,
+                        owner=class_name,  # Use class_name parameter instead of cls.name
                         name="<init>",
                         descriptor=method.descriptor,
                         is_static=False,
@@ -448,7 +537,7 @@ class ResolutionMixin:
                             )
                             if varargs_match:
                                 candidates.append(ResolvedMethod(
-                                    owner=cls.name,
+                                    owner=class_name,  # Use class_name parameter
                                     name="<init>",
                                     descriptor=method.descriptor,
                                     is_static=False,
@@ -540,7 +629,10 @@ class ResolutionMixin:
 
         elif isinstance(t, ast.ArrayType):
             elem = self.resolve_type(t.element_type)
-            return ArrayJType(elem, t.dimensions)
+            result = ArrayJType(elem, t.dimensions)
+            import sys
+            print(f"DEBUG resolve_type: ArrayType -> {result}, elem={elem}, dims={t.dimensions}", file=sys.stderr)
+            return result
 
         else:
             raise CompileError(f"Unsupported type: {type(t).__name__}")

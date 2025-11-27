@@ -21,9 +21,14 @@ class ArrayCompilerMixin:
         """Compile array creation: new int[10] or new int[] {1, 2}"""
         builder = ctx.builder
 
-        # Resolve element type
-        elem_type = self.resolve_type(expr.type)
-        array_type = ArrayJType(elem_type)
+        # Resolve base element type
+        base_type = self.resolve_type(expr.type)
+
+        # Count total dimensions (including unspecified ones)
+        num_dimensions = len(expr.dimensions) if expr.dimensions else 1
+
+        # Build array type with dimensions
+        array_type = ArrayJType(base_type, num_dimensions)
 
         if expr.initializer:
             # Array with initializer: new int[] {1, 2, 3}
@@ -34,23 +39,37 @@ class ArrayCompilerMixin:
             builder.iconst(size)
 
             # Create array
-            self._emit_newarray(elem_type, builder)
+            self._emit_newarray(base_type, builder)
 
             # Fill array with elements
             for i, element in enumerate(elements):
                 builder.dup()  # dup array ref
                 builder.iconst(i)  # push index
                 self.compile_expression(element, ctx)  # push value
-                self._emit_array_store(elem_type, builder)
+                self._emit_array_store(base_type, builder)
+
+        elif num_dimensions > 1:
+            # Multidimensional array: new int[2][3]
+            # Count how many dimensions have size expressions
+            dim_count = 0
+            for dim_expr in expr.dimensions:
+                if dim_expr is not None:
+                    self.compile_expression(dim_expr, ctx)
+                    dim_count += 1
+                else:
+                    break  # Stop at first unspecified dimension
+
+            # Use multianewarray instruction
+            builder.multianewarray(array_type.descriptor(), dim_count)
 
         else:
-            # Array with size: new int[10]
+            # Single-dimensional array with size: new int[10]
             if expr.dimensions and expr.dimensions[0] is not None:
                 self.compile_expression(expr.dimensions[0], ctx)
             else:
                 raise CompileError("Array creation requires size or initializer")
 
-            self._emit_newarray(elem_type, builder)
+            self._emit_newarray(base_type, builder)
 
         return array_type
 
@@ -93,8 +112,15 @@ class ArrayCompilerMixin:
         # Compile index
         self.compile_expression(expr.index, ctx)
 
+        # Determine element type after indexing
+        if array_type.dimensions > 1:
+            # Multidimensional array: int[][] -> int[]
+            elem_type = ArrayJType(array_type.element_type, array_type.dimensions - 1)
+        else:
+            # Single-dimensional array: int[] -> int
+            elem_type = array_type.element_type
+
         # Load element
-        elem_type = array_type.element_type
         self._emit_array_load(elem_type, builder)
 
         return elem_type

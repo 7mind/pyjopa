@@ -6,7 +6,7 @@ from typing import Optional
 from .. import ast
 from ..types import (
     JType, ClassJType, ArrayJType,
-    VOID, BOOLEAN, INT, LONG, FLOAT, DOUBLE,
+    VOID, BOOLEAN, INT, LONG, FLOAT, DOUBLE, STRING,
 )
 from ..classfile import BytecodeBuilder, ExceptionTableEntry
 from .types import CompileError, MethodContext, LocalVariable
@@ -391,9 +391,15 @@ class StatementCompilerMixin:
         builder = ctx.builder
         end_label = self.new_label("endswitch")
 
-        # Compile the switch expression
-        self.compile_expression(stmt.expression, ctx)
+        # Compile the switch expression and get its type
+        switch_type = self.compile_expression(stmt.expression, ctx)
 
+        # Check if this is a String switch (Java 7 feature)
+        if switch_type == STRING:
+            self._compile_string_switch(stmt, ctx, end_label)
+            return
+
+        # Original integer switch logic
         # Collect case values and labels
         cases: list[tuple[int, str]] = []
         default_label = end_label  # Default to end if no default case
@@ -425,6 +431,66 @@ class StatementCompilerMixin:
         # Emit case bodies
         for i, case in enumerate(stmt.cases):
             builder.label(case_labels[i])
+            for stmt_in_case in case.statements:
+                self.compile_statement(stmt_in_case, ctx)
+
+        # Restore switch break label
+        ctx.switch_break_label = old_switch_break
+
+        builder.label(end_label)
+
+    def _compile_string_switch(self, stmt: ast.SwitchStatement, ctx: MethodContext, end_label: str):
+        """Compile a switch on String using if-else chains with String.equals()."""
+        builder = ctx.builder
+
+        # Store the switch expression in a temporary variable
+        temp_var = ctx.add_local(f"$switch_temp{id(stmt)}", STRING)
+        self.store_local(temp_var, builder)
+
+        # Set switch break label
+        old_switch_break = ctx.switch_break_label
+        ctx.switch_break_label = end_label
+
+        # Pre-create all case body labels
+        case_body_labels = [self.new_label(f"case{i}_body") for i in range(len(stmt.cases))]
+
+        # Find default case index
+        default_case_index = None
+        for i, case in enumerate(stmt.cases):
+            if any(label is None for label in case.labels):
+                default_case_index = i
+                break
+
+        # Generate if-else chain for each case
+        for i, case in enumerate(stmt.cases):
+            # For each non-default label in this case
+            for label in case.labels:
+                if label is not None:
+                    # Load the temp variable
+                    self.load_local(temp_var, builder)
+
+                    # Push the string literal
+                    if isinstance(label, ast.Literal) and label.kind == "string":
+                        string_value = self.parse_string_literal(label.value)
+                        builder.ldc_string(string_value)
+                    else:
+                        raise CompileError(f"Switch case label must be a string literal: {label}")
+
+                    # Call String.equals()
+                    builder.invokevirtual("java/lang/String", "equals", "(Ljava/lang/Object;)Z", 1, 1)
+
+                    # If true, jump to case body
+                    builder.ifne(case_body_labels[i])
+
+        # After all case comparisons, handle default or jump to end
+        if default_case_index is not None:
+            builder.goto(case_body_labels[default_case_index])
+        else:
+            builder.goto(end_label)
+
+        # Emit case bodies
+        for i, case in enumerate(stmt.cases):
+            builder.label(case_body_labels[i])
             for stmt_in_case in case.statements:
                 self.compile_statement(stmt_in_case, ctx)
 

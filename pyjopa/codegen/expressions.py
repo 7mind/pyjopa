@@ -156,6 +156,23 @@ class ExpressionCompilerMixin:
             if field:
                 return field.type
             return ClassJType("java/lang/Object")
+        elif isinstance(expr, ast.FieldAccess):
+            # Handle field access like p1.x
+            if isinstance(expr.target, ast.ThisExpression):
+                field = self._find_field(self.class_name, expr.field)
+                if field:
+                    return field.type
+            elif isinstance(expr.target, ast.Identifier):
+                # Look up the identifier type first
+                target_type = self._estimate_expression_type(expr.target, ctx)
+                if isinstance(target_type, ClassJType):
+                    field_info = self._find_field(target_type.internal_name(), expr.field)
+                    if field_info:
+                        return field_info.type
+                elif isinstance(target_type, ArrayJType):
+                    if expr.field == "length":
+                        return INT
+            return ClassJType("java/lang/Object")
         elif isinstance(expr, ast.QualifiedName) and expr.parts == ("super",):
             return ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
         elif isinstance(expr, ast.SuperExpression):
@@ -163,6 +180,9 @@ class ExpressionCompilerMixin:
         elif isinstance(expr, ast.BinaryExpression):
             left_type = self._estimate_expression_type(expr.left, ctx)
             right_type = self._estimate_expression_type(expr.right, ctx)
+            # String concatenation takes precedence
+            if expr.operator == "+" and (left_type == STRING or right_type == STRING):
+                return STRING
             if left_type == LONG or right_type == LONG:
                 return LONG
             if left_type == DOUBLE or right_type == DOUBLE:
@@ -344,6 +364,65 @@ class ExpressionCompilerMixin:
 
         # Numeric promotion
         result_type = binary_numeric_promotion(left_type, right_type)
+
+        # Emit conversion instructions for binary numeric promotion
+        # Stack is: left, right (right is on top)
+        # Need to convert right first, then swap and convert left if needed
+        if right_type != result_type:
+            # Convert right operand
+            if right_type == INT and result_type == LONG:
+                builder.i2l()
+            elif right_type == INT and result_type == FLOAT:
+                builder.i2f()
+            elif right_type == INT and result_type == DOUBLE:
+                builder.i2d()
+            elif right_type == LONG and result_type == FLOAT:
+                builder.l2f()
+            elif right_type == LONG and result_type == DOUBLE:
+                builder.l2d()
+            elif right_type == FLOAT and result_type == DOUBLE:
+                builder.f2d()
+
+        if left_type != result_type:
+            # Need to convert left operand which is below right on stack
+            # For single-word types: swap, convert, swap
+            # For double-word types: more complex
+            if result_type == LONG or result_type == DOUBLE:
+                # Result is double-word (takes 2 stack slots)
+                if left_type == INT or left_type == FLOAT:
+                    # Left is single-word, right is double-word after conversion
+                    # Stack: left(1), right(2)
+                    # Use dup2_x1, pop2 to get left on top
+                    builder.dup2_x1()  # right, left, right
+                    builder.pop2()     # right, left
+                    # Convert left
+                    if left_type == INT and result_type == LONG:
+                        builder.i2l()
+                    elif left_type == INT and result_type == DOUBLE:
+                        builder.i2d()
+                    elif left_type == FLOAT and result_type == DOUBLE:
+                        builder.f2d()
+                    # Stack: right(2), left_converted(2)
+                    # Swap double-words
+                    builder.dup2_x2()  # left, right, left
+                    builder.pop2()     # left, right
+                else:
+                    # Both are double-word - simple swap
+                    builder.dup2_x2()
+                    builder.pop2()
+                    # Convert left
+                    if left_type == LONG and result_type == DOUBLE:
+                        builder.l2d()
+                    # Swap back
+                    builder.dup2_x2()
+                    builder.pop2()
+            else:
+                # Result is single-word
+                builder.swap()
+                # Convert left
+                if left_type == INT and result_type == FLOAT:
+                    builder.i2f()
+                builder.swap()
 
         if op == "+":
             if result_type == INT:
@@ -787,7 +866,13 @@ class ExpressionCompilerMixin:
         if not isinstance(array_type, ArrayJType):
             raise CompileError(f"Cannot index non-array type: {array_type}")
 
-        elem_type = array_type.element_type
+        # Determine element type after indexing
+        if array_type.dimensions > 1:
+            # Multidimensional array: int[][] -> int[]
+            elem_type = ArrayJType(array_type.element_type, array_type.dimensions - 1)
+        else:
+            # Single-dimensional array: int[] -> int
+            elem_type = array_type.element_type
 
         # Compile index
         self.compile_expression(aa.index, ctx)

@@ -81,6 +81,34 @@ class CodeGenerator(
                 return (ConstantPoolTag.STRING, self.parse_string_literal(initializer.value))
         return None
 
+    def _register_local_constructor(self, ctor: ast.ConstructorDeclaration):
+        """Register a constructor for forward reference resolution."""
+        param_types = []
+        is_varargs = False
+        for i, param in enumerate(ctor.parameters):
+            ptype = self.resolve_type(param.type)
+            param_types.append(ptype)
+            if param.varargs:
+                is_varargs = True
+
+        # Build descriptor
+        param_descs = "".join(t.descriptor() for t in param_types)
+        descriptor = f"({param_descs})V"
+
+        info = LocalMethodInfo(
+            name="<init>",
+            descriptor=descriptor,
+            is_static=False,
+            return_type=VOID,
+            param_types=tuple(param_types),
+            is_varargs=is_varargs,
+        )
+
+        if "<init>" not in self._local_methods:
+            self._local_methods["<init>"] = []
+        self._local_methods["<init>"].append(info)
+        self._local_constructors.append(info)
+
     def _register_local_method(self, method: ast.MethodDeclaration):
         """Register a method for forward reference resolution."""
         is_static = any(m.keyword == "static" for m in method.modifiers)
@@ -654,6 +682,7 @@ class CodeGenerator(
 
         # First pass: collect field and method signatures for forward references
         self._local_methods = {}
+        self._local_constructors = []  # List of constructor signatures
         self._local_fields = {}
         self._static_init_sequence = []
         self._instance_init_sequence = []
@@ -663,6 +692,8 @@ class CodeGenerator(
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
                 self._register_local_method(member)
+            elif isinstance(member, ast.ConstructorDeclaration):
+                self._register_local_constructor(member)
             elif isinstance(member, ast.FieldDeclaration):
                 self._register_local_field(member)
 
@@ -985,10 +1016,56 @@ class CodeGenerator(
         if invocation.qualifier is not None:
             raise CompileError("Qualified constructor invocations are not supported")
         if invocation.kind == "this":
-            raise CompileError("Constructor chaining with this(...) is not supported")
-        if invocation.kind != "super":
+            self._invoke_this_constructor(invocation.arguments, ctx)
+        elif invocation.kind == "super":
+            self._invoke_super_constructor(invocation.arguments, ctx)
+        else:
             raise CompileError(f"Unsupported constructor invocation kind: {invocation.kind}")
-        self._invoke_super_constructor(invocation.arguments, ctx)
+
+    def _invoke_this_constructor(self, arguments: tuple[ast.Expression, ...], ctx: MethodContext):
+        """Invoke another constructor in the same class using this(...)."""
+        arg_types = [self._estimate_expression_type(arg, ctx) for arg in arguments]
+        resolved = self._find_constructor(self.class_name, arg_types)
+
+        if resolved is None:
+            raise CompileError(f"Cannot resolve this(...) constructor in {self.class_name} with args {arg_types}")
+
+        target_owner = resolved.owner
+        descriptor = resolved.descriptor
+        param_types = resolved.param_types
+
+        builder = ctx.builder
+        builder.aload(0)  # load 'this'
+
+        # Compile and convert arguments
+        if resolved.is_varargs and param_types:
+            num_regular = len(param_types) - 1
+            varargs_type = param_types[-1]
+            for idx in range(num_regular):
+                actual_type = self.compile_expression(arguments[idx], ctx)
+                self.emit_conversion(actual_type, param_types[idx], builder)
+
+            if not isinstance(varargs_type, ArrayJType):
+                raise CompileError(f"Varargs parameter must be array type, got: {varargs_type}")
+            elem_type = varargs_type.element_type
+
+            varargs_args = arguments[num_regular:]
+            builder.iconst(len(varargs_args))
+            self._emit_newarray(elem_type, builder)
+
+            for idx, arg in enumerate(varargs_args):
+                builder.dup()
+                builder.iconst(idx)
+                actual_type = self.compile_expression(arg, ctx)
+                self.emit_conversion(actual_type, elem_type, builder)
+                self._emit_array_store(elem_type, builder)
+        else:
+            for arg, target_type in zip(arguments, param_types):
+                actual_type = self.compile_expression(arg, ctx)
+                self.emit_conversion(actual_type, target_type, builder)
+
+        arg_slots = sum(t.size for t in param_types)
+        builder.invokespecial(target_owner, "<init>", descriptor, arg_slots, 0)
 
     def _invoke_super_constructor(self, arguments: tuple[ast.Expression, ...], ctx: MethodContext):
         arg_types = [self._estimate_expression_type(arg, ctx) for arg in arguments]

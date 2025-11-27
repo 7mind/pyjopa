@@ -1350,6 +1350,22 @@ class BytecodeBuilder:
         self._pop()  # pop count
         self._push()  # push array ref
 
+    def multianewarray(self, descriptor: str, dimensions: int):
+        """Create multidimensional array.
+
+        Args:
+            descriptor: Array type descriptor (e.g., "[[I" for int[][])
+            dimensions: Number of dimensions to allocate
+        """
+        idx = self.cp.add_class(descriptor)
+        self._emit(Opcode.MULTIANEWARRAY)
+        self.code.extend(struct.pack(">H", idx))
+        self.code.append(dimensions)
+        # Pop dimension counts, push array ref
+        for _ in range(dimensions):
+            self._pop()
+        self._push()
+
     def iaload(self):
         """Load int from array."""
         self._emit(Opcode.IALOAD)
@@ -1569,6 +1585,17 @@ class BytecodeBuilder:
     def pop(self):
         self._emit(Opcode.POP)
         self._pop()
+
+    def pop2(self):
+        """Pop top two stack values (or one double-word value)."""
+        self._emit(Opcode.POP2)
+        self._pop(2)
+
+    def swap(self):
+        """Swap the top two stack values."""
+        self._emit(Opcode.SWAP)
+        # Stack effect: ..., value2, value1 -> ..., value1, value2
+        # No net change in stack depth
 
     def athrow(self):
         """Throw exception (objectref must be on stack)."""
