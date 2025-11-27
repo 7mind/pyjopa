@@ -12,7 +12,7 @@ from ..types import (
 from ..classreader import ClassPath, ClassInfo as ReadClassInfo
 from ..classfile import AccessFlags
 from .types import (
-    CompileError, ResolvedMethod, LocalMethodInfo, JAVA_LANG_CLASSES,
+    CompileError, ResolvedMethod, ResolvedField, LocalMethodInfo, JAVA_LANG_CLASSES,
 )
 
 
@@ -104,6 +104,12 @@ class ResolutionMixin:
                                         param_types=local_method.param_types,
                                         is_varargs=True,
                                     )
+
+        if class_name == self.class_name and getattr(self, "super_class_name", None):
+            if self.super_class_name != self.class_name:
+                inherited = self._find_method(self.super_class_name, method_name, arg_types)
+                if inherited:
+                    return inherited
 
         cls = self._lookup_class(class_name)
         if not cls:
@@ -197,7 +203,33 @@ class ResolutionMixin:
         if isinstance(from_type, ClassJType) and isinstance(to_type, ClassJType):
             if from_type.internal_name() == to_type.internal_name():
                 return True
+            if self._is_subclass(from_type.internal_name(), to_type.internal_name()):
+                return True
 
+        return False
+
+    def _is_subclass(self, subclass_name: str, superclass_name: str) -> bool:
+        """Check if subclass_name extends superclass_name using available class metadata."""
+        current = subclass_name
+        visited = set()
+        while current and current not in visited:
+            visited.add(current)
+            if current == superclass_name:
+                return True
+
+            next_super = None
+            if current == self.class_name and getattr(self, "super_class_name", None):
+                next_super = self.super_class_name
+            else:
+                cls = self._lookup_class(current)
+                if cls:
+                    next_super = cls.super_class
+
+            if not next_super:
+                return False
+            if next_super == superclass_name:
+                return True
+            current = next_super
         return False
 
     def _most_specific_method(self, candidates: list[ResolvedMethod], arg_types: list[JType]) -> ResolvedMethod:
@@ -231,13 +263,28 @@ class ResolutionMixin:
                         return True
         return False
 
-    def _find_field(self, class_name: str, field_name: str) -> Optional[tuple[str, str, JType]]:
-        """Find a field in a class. Returns (owner, descriptor, type)."""
-        # Check if it's the current class being compiled
+    def _find_field(self, class_name: str, field_name: str) -> Optional[ResolvedField]:
+        """Find a field in a class or its superclasses."""
         if class_name == self.class_name and hasattr(self, '_local_fields'):
             if field_name in self._local_fields:
                 field = self._local_fields[field_name]
-                return (self.class_name, field.descriptor, field.jtype)
+                return ResolvedField(
+                    owner=self.class_name,
+                    descriptor=field.descriptor,
+                    type=field.jtype,
+                    is_static=field.is_static,
+                )
+
+        if class_name == self.class_name and getattr(self, "super_class_name", None):
+            if self.super_class_name != self.class_name:
+                inherited_field = self._find_field(self.super_class_name, field_name)
+                if inherited_field:
+                    return inherited_field
+            # Search implemented interfaces
+            if getattr(self, "class_file", None):
+                iface_result = self._find_field_in_interfaces(field_name, getattr(self.class_file, "interfaces", []))
+                if iface_result:
+                    return iface_result
 
         cls = self._lookup_class(class_name)
         if not cls:
@@ -248,11 +295,96 @@ class ResolutionMixin:
             for fld in current.fields:
                 if fld.name == field_name:
                     jtype = self._descriptor_to_type(fld.descriptor)
-                    return (current.name, fld.descriptor, jtype)
+                    is_static = (fld.access_flags & AccessFlags.STATIC) != 0
+                    return ResolvedField(
+                        owner=current.name,
+                        descriptor=fld.descriptor,
+                        type=jtype,
+                        is_static=is_static,
+                    )
             if current.super_class:
                 current = self._lookup_class(current.super_class)
             else:
                 break
+        # Search interfaces recursively
+        iface_result = self._find_field_in_interfaces(field_name, cls.interfaces if cls else ())
+        if iface_result:
+            return iface_result
+        return None
+
+    def _find_field_in_interfaces(self, field_name: str, interfaces: tuple[str, ...] | list[str]) -> Optional[ResolvedField]:
+        for iface_name in interfaces:
+            iface = self._lookup_class(iface_name)
+            if not iface:
+                continue
+            for fld in iface.fields:
+                if fld.name == field_name:
+                    jtype = self._descriptor_to_type(fld.descriptor)
+                    is_static = (fld.access_flags & AccessFlags.STATIC) != 0
+                    return ResolvedField(
+                        owner=iface.name,
+                        descriptor=fld.descriptor,
+                        type=jtype,
+                        is_static=is_static,
+                    )
+            nested = self._find_field_in_interfaces(field_name, iface.interfaces)
+            if nested:
+                return nested
+        return None
+
+    def _find_constructor(self, class_name: str, arg_types: list[JType]) -> Optional[ResolvedMethod]:
+        """Find a constructor in the given class matching the argument types."""
+        cls = self._lookup_class(class_name)
+        if not cls:
+            return None
+
+        candidates = []
+        is_interface = (cls.access_flags & AccessFlags.INTERFACE) != 0
+
+        for method in cls.methods:
+            if method.name != "<init>":
+                continue
+            return_type, param_types = self._parse_method_descriptor(method.descriptor)
+            if len(param_types) == len(arg_types):
+                if self._args_compatible(arg_types, param_types):
+                    candidates.append(ResolvedMethod(
+                        owner=cls.name,
+                        name="<init>",
+                        descriptor=method.descriptor,
+                        is_static=False,
+                        is_interface=is_interface,
+                        return_type=return_type,
+                        param_types=param_types,
+                    ))
+            elif (method.access_flags & AccessFlags.VARARGS) and param_types:
+                num_regular = len(param_types) - 1
+                if len(arg_types) >= num_regular:
+                    regular_match = all(
+                        self._type_assignable(arg_types[i], param_types[i])
+                        for i in range(num_regular)
+                    )
+                    if regular_match:
+                        varargs_param = param_types[-1]
+                        if isinstance(varargs_param, ArrayJType):
+                            elem_type = varargs_param.element_type
+                            varargs_match = all(
+                                self._type_assignable(arg_types[i], elem_type)
+                                for i in range(num_regular, len(arg_types))
+                            )
+                            if varargs_match:
+                                candidates.append(ResolvedMethod(
+                                    owner=cls.name,
+                                    name="<init>",
+                                    descriptor=method.descriptor,
+                                    is_static=False,
+                                    is_interface=is_interface,
+                                    return_type=return_type,
+                                    param_types=param_types,
+                                    is_varargs=True,
+                                ))
+
+        if candidates:
+            return self._most_specific_method(candidates, arg_types)
         return None
 
     def _parse_method_descriptor(self, descriptor: str) -> tuple[JType, tuple[JType, ...]]:
@@ -326,4 +458,3 @@ class ResolutionMixin:
 
         else:
             raise CompileError(f"Unsupported type: {type(t).__name__}")
-

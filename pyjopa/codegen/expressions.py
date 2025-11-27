@@ -9,7 +9,7 @@ from ..types import (
     VOID, BOOLEAN, BYTE, CHAR, SHORT, INT, LONG, FLOAT, DOUBLE,
     STRING, is_numeric, binary_numeric_promotion,
 )
-from ..classfile import BytecodeBuilder
+from ..classfile import BytecodeBuilder, AccessFlags
 from .types import CompileError, MethodContext, LocalVariable, ResolvedMethod
 
 
@@ -50,15 +50,14 @@ class ExpressionCompilerMixin:
                 var = ctx.get_local(expr.name)
                 self.load_local(var, builder)
                 return var.type
-            # Check class fields
-            if hasattr(self, '_local_fields') and expr.name in self._local_fields:
-                field = self._local_fields[expr.name]
+            field = self._find_field(self.class_name, expr.name)
+            if field:
                 if field.is_static:
-                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                    builder.getstatic(field.owner, expr.name, field.descriptor)
                 else:
-                    builder.aload(0)  # load this
-                    builder.getfield(self.class_name, field.name, field.descriptor)
-                return field.jtype
+                    builder.aload(0)
+                    builder.getfield(field.owner, expr.name, field.descriptor)
+                return field.type
             raise CompileError(f"Undefined variable: {expr.name}")
 
         elif isinstance(expr, ast.ParenthesizedExpression):
@@ -96,6 +95,10 @@ class ExpressionCompilerMixin:
         elif isinstance(expr, ast.ThisExpression):
             builder.aload(0)
             return ClassJType(self.class_name)
+
+        elif isinstance(expr, ast.SuperExpression):
+            builder.aload(0)
+            return ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
 
         elif isinstance(expr, ast.FieldAccess):
             return self.compile_field_access(expr, ctx)
@@ -140,7 +143,14 @@ class ExpressionCompilerMixin:
         elif isinstance(expr, ast.Identifier):
             if expr.name in ctx.locals:
                 return ctx.get_local(expr.name).type
+            field = self._find_field(self.class_name, expr.name)
+            if field:
+                return field.type
             return ClassJType("java/lang/Object")
+        elif isinstance(expr, ast.QualifiedName) and expr.parts == ("super",):
+            return ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
+        elif isinstance(expr, ast.SuperExpression):
+            return ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
         elif isinstance(expr, ast.BinaryExpression):
             left_type = self._estimate_expression_type(expr.left, ctx)
             right_type = self._estimate_expression_type(expr.right, ctx)
@@ -867,12 +877,17 @@ class ExpressionCompilerMixin:
         # Determine the target type (but don't load it yet - need to check if static first)
         target_type = None
         is_static_call = False
+        is_super_call = False
         needs_this_load = False  # Will be set if we need to load 'this' later
 
         if expr.target is None:
             # Method call on this (or static call to same class - need to check later)
             target_type = ClassJType(self.class_name)
             needs_this_load = True  # Tentatively - will skip if method is static
+        elif isinstance(expr.target, ast.SuperExpression):
+            target_type = ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
+            is_super_call = True
+            builder.aload(0)
         elif isinstance(expr.target, ast.Identifier):
             # Could be a local variable or a class name
             if expr.target.name in ctx.locals:
@@ -884,6 +899,10 @@ class ExpressionCompilerMixin:
                 is_static_call = True
                 resolved_name = self._resolve_class_name(expr.target.name)
                 target_type = ClassJType(resolved_name)
+        elif isinstance(expr.target, ast.QualifiedName) and expr.target.parts == ("super",):
+            target_type = ClassJType(getattr(self, "super_class_name", "java/lang/Object"))
+            is_super_call = True
+            builder.aload(0)
         elif isinstance(expr.target, ast.QualifiedName):
             # Could be a local variable (single name) or a class name for static call
             if len(expr.target.parts) == 1:
@@ -979,6 +998,9 @@ class ExpressionCompilerMixin:
         elif resolved.is_interface:
             builder.invokeinterface(resolved.owner, resolved.name, resolved.descriptor,
                                     args_slots + 1, return_slots)
+        elif is_super_call:
+            builder.invokespecial(resolved.owner, resolved.name, resolved.descriptor,
+                                  args_slots + 1, return_slots)
         else:
             builder.invokevirtual(resolved.owner, resolved.name, resolved.descriptor,
                                   args_slots + 1, return_slots)
@@ -1001,9 +1023,10 @@ class ExpressionCompilerMixin:
                 # Look up the field
                 field_info = self._find_field(target_type.internal_name(), fa.field)
                 if field_info:
-                    owner, desc, ftype = field_info
-                    builder.getstatic(owner, fa.field, desc)
-                    return ftype
+                    if not field_info.is_static:
+                        raise CompileError(f"Field {fa.field} on {target_type.internal_name()} is not static")
+                    builder.getstatic(field_info.owner, fa.field, field_info.descriptor)
+                    return field_info.type
                 raise CompileError(f"Cannot find field: {fa.target.name}.{fa.field}")
         else:
             target_type = self.compile_expression(fa.target, ctx)
@@ -1014,9 +1037,10 @@ class ExpressionCompilerMixin:
         # Look up the field in the class
         field_info = self._find_field(target_type.internal_name(), fa.field)
         if field_info:
-            owner, desc, ftype = field_info
-            builder.getfield(owner, fa.field, desc)
-            return ftype
+            if field_info.is_static:
+                raise CompileError("Static field access through instance is not supported")
+            builder.getfield(field_info.owner, fa.field, field_info.descriptor)
+            return field_info.type
 
         raise CompileError(f"Cannot find field: {target_type.internal_name()}.{fa.field}")
 
@@ -1027,14 +1051,14 @@ class ExpressionCompilerMixin:
         # Handle this.field
         if expr.parts[0] == "this" and len(expr.parts) == 2:
             field_name = expr.parts[1]
-            if hasattr(self, '_local_fields') and field_name in self._local_fields:
-                field = self._local_fields[field_name]
+            field = self._find_field(self.class_name, field_name)
+            if field:
                 if field.is_static:
-                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                    builder.getstatic(field.owner, field_name, field.descriptor)
                 else:
                     builder.aload(0)
-                    builder.getfield(self.class_name, field.name, field.descriptor)
-                return field.jtype
+                    builder.getfield(field.owner, field_name, field.descriptor)
+                return field.type
             raise CompileError(f"Unknown field: {field_name}")
 
         # Check if first part is a local variable (e.g., obj.field)
@@ -1056,9 +1080,10 @@ class ExpressionCompilerMixin:
                     field_info = self._find_field(current_type.internal_name(), part)
                     if not field_info:
                         raise CompileError(f"Unknown field: {current_type.internal_name()}.{part}")
-                    owner, desc, ftype = field_info
-                    builder.getfield(owner, part, desc)
-                    current_type = ftype
+                    if field_info.is_static:
+                        raise CompileError("Static field access through instance is not supported")
+                    builder.getfield(field_info.owner, part, field_info.descriptor)
+                    current_type = field_info.type
                 else:
                     raise CompileError(f"Cannot access field on type: {current_type}")
 
@@ -1132,14 +1157,24 @@ class ExpressionCompilerMixin:
 
         # Handle this.field
         if isinstance(expr.target, ast.ThisExpression):
-            if hasattr(self, '_local_fields') and expr.field in self._local_fields:
-                field = self._local_fields[expr.field]
+            field = self._find_field(self.class_name, expr.field)
+            if field:
                 if field.is_static:
-                    builder.getstatic(self.class_name, field.name, field.descriptor)
+                    builder.getstatic(field.owner, expr.field, field.descriptor)
                 else:
                     builder.aload(0)
-                    builder.getfield(self.class_name, field.name, field.descriptor)
-                return field.jtype
+                    builder.getfield(field.owner, expr.field, field.descriptor)
+                return field.type
+            raise CompileError(f"Unknown field: {expr.field}")
+
+        if isinstance(expr.target, ast.SuperExpression):
+            field = self._find_field(getattr(self, "super_class_name", self.class_name), expr.field)
+            if field:
+                if field.is_static:
+                    raise CompileError("Accessing static fields through super is not supported")
+                builder.aload(0)
+                builder.getfield(field.owner, expr.field, field.descriptor)
+                return field.type
             raise CompileError(f"Unknown field: {expr.field}")
 
         # Compile the target expression
@@ -1158,9 +1193,10 @@ class ExpressionCompilerMixin:
         # Look up the field
         field_info = self._find_field(target_type.internal_name(), expr.field)
         if field_info:
-            owner, desc, ftype = field_info
-            builder.getfield(owner, expr.field, desc)
-            return ftype
+            if field_info.is_static:
+                raise CompileError("Static field access through instance is not supported")
+            builder.getfield(field_info.owner, expr.field, field_info.descriptor)
+            return field_info.type
 
         raise CompileError(f"Unknown field: {target_type.internal_name()}.{expr.field}")
 
@@ -1169,6 +1205,16 @@ class ExpressionCompilerMixin:
         builder = ctx.builder
 
         type_name = self._resolve_class_name(expr.type.name) if isinstance(expr.type, ast.ClassType) else str(expr.type)
+        # Prevent instantiation of abstract classes or interfaces when info is available
+        cls_info = self._lookup_class(type_name) if hasattr(self, "_lookup_class") else None
+        if cls_info:
+            if cls_info.access_flags & AccessFlags.INTERFACE:
+                raise CompileError(f"Cannot instantiate interface {type_name}")
+            if cls_info.access_flags & AccessFlags.ABSTRACT:
+                raise CompileError(f"Cannot instantiate abstract class {type_name}")
+        elif type_name == self.class_name and self.class_file:
+            if self.class_file.access_flags & AccessFlags.ABSTRACT:
+                raise CompileError(f"Cannot instantiate abstract class {type_name}")
 
         # new ClassName
         builder.new(type_name)
@@ -1188,4 +1234,3 @@ class ExpressionCompilerMixin:
         builder.invokespecial(type_name, "<init>", desc, args_slots, 0)
 
         return ClassJType(type_name)
-

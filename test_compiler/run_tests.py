@@ -952,6 +952,113 @@ public class Varargs {
 ''',
         expected_output="6\n30\n"
     ),
+
+    # Inheritance: super constructor, inherited fields/methods
+    TestCase(
+        name="InheritanceSuper",
+        source='''
+public class Base {
+    protected int value;
+
+    public Base(int v) {
+        this.value = v;
+    }
+
+    public int add(int x) {
+        return value + x;
+    }
+}
+
+public class Derived extends Base {
+    public Derived(int v) {
+        super(v + 1);
+    }
+
+    public int getPlusTwo() {
+        return value + 2;
+    }
+
+    public int callAdd(int x) {
+        return add(x);
+    }
+
+    public static void main(String[] args) {
+        Derived d = new Derived(5);
+        System.out.println(d.getPlusTwo());
+        System.out.println(d.callAdd(10));
+    }
+}
+''',
+        expected_output="8\n16\n",
+        main_class="Derived"
+    ),
+
+    TestCase(
+        name="SuperKeyword",
+        source='''
+public class SuperCallBase {
+    protected int value;
+
+    public SuperCallBase() {
+        this.value = 1;
+    }
+
+    public int add(int x) {
+        return value + x;
+    }
+}
+
+public class SuperKeyword extends SuperCallBase {
+    protected int value = 100;
+
+    @Override
+    public int add(int x) {
+        return value + x;
+    }
+
+    public int callSuper(int x) {
+        return super.add(x);
+    }
+
+    public int readSuperField() {
+        return super.value;
+    }
+
+    public static void main(String[] args) {
+        SuperKeyword s = new SuperKeyword();
+        System.out.println(s.callSuper(5));
+        System.out.println(s.readSuperField());
+    }
+}
+''',
+        expected_output="6\n1\n",
+        main_class="SuperKeyword"
+    ),
+
+    TestCase(
+        name="InterfaceBasic",
+        source='''
+interface Greeter {
+    int BASE = 2;
+    void greet(int x);
+}
+
+class InterfaceImpl implements Greeter {
+    public void greet(int x) {
+        System.out.println(BASE + x);
+    }
+}
+
+public class InterfaceBasic {
+    public static void main(String[] args) {
+        Greeter g = new InterfaceImpl();
+        g.greet(3);
+    }
+}
+''',
+        expected_output="5\n",
+        main_class="InterfaceBasic"
+    ),
 ]
 
 MULTI_FILE_TESTS = [

@@ -163,6 +163,21 @@ class SignatureMixin:
             sig += self._generate_type_signature(iface)
         return sig
 
+    def _generate_interface_signature(self, iface: ast.InterfaceDeclaration) -> Optional[str]:
+        """Generate interface signature if it has type parameters."""
+        if not iface.type_parameters and not iface.extends:
+            return None
+        self._type_param_names = {tp.name for tp in iface.type_parameters}
+        sig = ""
+        if iface.type_parameters:
+            sig += self._generate_type_params_signature(iface.type_parameters)
+        if iface.extends:
+            for ext in iface.extends:
+                sig += self._generate_type_signature(ext)
+        else:
+            sig += "Ljava/lang/Object;"
+        return sig
+
     def _generate_method_signature(self, method: ast.MethodDeclaration, class_type_params: set[str]) -> Optional[str]:
         """Generate method signature if method uses generics."""
         self._type_param_names = class_type_params.copy()
@@ -208,4 +223,3 @@ class SignatureMixin:
                 return True
             return False
         return False
-

@@ -152,10 +152,7 @@ class Java8Transformer(Transformer):
             elif isinstance(item, ast.Type) and extends is None:
                 extends = item
             elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
-                if extends is None:
-                    extends = item[0] if len(item) == 1 else None
-                else:
-                    implements = item
+                implements = item
             elif isinstance(item, tuple) and (not item or isinstance(item[0], ast.ClassBodyDeclaration)):
                 body = item
 
@@ -423,10 +420,14 @@ class Java8Transformer(Transformer):
                 name = str(item)
             elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
                 implements = item
-            elif isinstance(item, tuple) and item and isinstance(item[0], ast.EnumConstant):
-                constants = item
-            elif isinstance(item, tuple) and (not item or isinstance(item[0], ast.ClassBodyDeclaration)):
-                body = item
+            elif isinstance(item, tuple):
+                if len(item) == 2 and item and isinstance(item[0], tuple) and (not item[0] or isinstance(item[0][0], ast.EnumConstant)):
+                    constants = item[0]
+                    body = item[1]
+                elif item and isinstance(item[0], ast.EnumConstant):
+                    constants = item
+                elif not item or (item and isinstance(item[0], ast.ClassBodyDeclaration)):
+                    body = item
 
         return ast.EnumDeclaration(
             modifiers=tuple(modifiers),
@@ -827,6 +828,35 @@ class Java8Transformer(Transformer):
             if isinstance(item, ast.TypeDeclaration):
                 return item
         return None
+
+    def explicit_constructor_invocation(self, items):
+        kind = "super"
+        arguments = ()
+        qualifier = None
+        type_args = ()
+
+        for item in items:
+            if isinstance(item, Token):
+                if item.type == "THIS":
+                    kind = "this"
+                elif item.type == "SUPER":
+                    kind = "super"
+            elif isinstance(item, str):
+                if item in ("this", "super"):
+                    kind = item
+            elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
+                type_args = item
+            elif isinstance(item, tuple) and (not item or isinstance(item[0], ast.Expression)):
+                arguments = item
+            elif isinstance(item, ast.Expression):
+                qualifier = item
+
+        return ast.ExplicitConstructorInvocation(
+            kind=kind,
+            arguments=arguments,
+            qualifier=qualifier,
+            type_arguments=type_args
+        )
 
     def local_variable_declaration(self, items):
         modifiers = []
@@ -1650,11 +1680,38 @@ class Java8Transformer(Transformer):
         for item in items:
             if isinstance(item, ast.Expression):
                 target = item
+            elif isinstance(item, Token) and item.type == "SUPER":
+                target = ast.SuperExpression(qualifier=None)
+            elif isinstance(item, str) and item == "super":
+                target = ast.SuperExpression(qualifier=None)
             elif isinstance(item, Token) and item.type == "IDENTIFIER":
                 field = str(item)
 
         return ast.FieldAccess(
             target=target or ast.ThisExpression(qualifier=None),
+            field=field or ""
+        )
+
+    def field_access_super(self, items):
+        field = None
+        for item in items:
+            if isinstance(item, Token) and item.type == "IDENTIFIER":
+                field = str(item)
+        return ast.FieldAccess(
+            target=ast.SuperExpression(qualifier=None),
+            field=field or ""
+        )
+
+    def field_access_type_super(self, items):
+        qualifier = None
+        field = None
+        for item in items:
+            if isinstance(item, ast.ClassType) and qualifier is None:
+                qualifier = item.name
+            elif isinstance(item, Token) and item.type == "IDENTIFIER":
+                field = str(item)
+        return ast.FieldAccess(
+            target=ast.SuperExpression(qualifier=qualifier),
             field=field or ""
         )
 
@@ -1681,7 +1738,11 @@ class Java8Transformer(Transformer):
         arguments = ()
 
         for item in items:
-            if isinstance(item, ast.Expression) and method is None:
+            if isinstance(item, Token) and item.type == "SUPER" and method is None and target is None:
+                target = ast.SuperExpression(qualifier=None)
+            elif isinstance(item, str) and item == "super" and method is None and target is None:
+                target = ast.SuperExpression(qualifier=None)
+            elif isinstance(item, ast.Expression) and method is None:
                 target = item
             elif isinstance(item, ast.ClassType) and method is None:
                 # Convert type name to QualifiedName for use as target
@@ -1703,6 +1764,29 @@ class Java8Transformer(Transformer):
             method=method or "",
             arguments=arguments
         )
+
+    def method_invocation_type(self, items):
+        return self.method_invocation(items)
+
+    def method_invocation_expr(self, items):
+        return self.method_invocation(items)
+
+    def method_invocation_primary(self, items):
+        return self.method_invocation(items)
+
+    def method_invocation_super(self, items):
+        # Prepend an explicit super target to leverage common handling
+        return self.method_invocation([ast.SuperExpression(qualifier=None)] + list(items))
+
+    def method_invocation_type_super(self, items):
+        qualifier = None
+        rest = []
+        for item in items:
+            if isinstance(item, ast.ClassType) and qualifier is None:
+                qualifier = item.name
+            else:
+                rest.append(item)
+        return self.method_invocation([ast.SuperExpression(qualifier=qualifier)] + rest)
 
     def argument_list(self, items):
         return tuple(item for item in items if isinstance(item, ast.Expression))
@@ -1782,6 +1866,8 @@ class Java8Transformer(Transformer):
             elif isinstance(item, str):
                 parts.append(item)
 
+        if len(parts) == 1 and parts[0] == "super":
+            return ast.SuperExpression(qualifier=None)
         if len(parts) == 1:
             return ast.Identifier(name=parts[0])
         return ast.QualifiedName(parts=tuple(parts))

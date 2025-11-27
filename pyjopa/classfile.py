@@ -554,6 +554,7 @@ class FieldInfo:
     descriptor: str
     signature: Optional[str] = None
     annotations: list = field(default_factory=list)
+    constant_value: Optional[tuple[int, any]] = None  # (tag, value)
 
     def write(self, cp: ConstantPool, out: bytearray):
         name_idx = cp.add_utf8(self.name)
@@ -568,12 +569,16 @@ class FieldInfo:
             attr_count += 1
         if self.annotations:
             attr_count += 1
+        if self.constant_value is not None:
+            attr_count += 1
 
         out.extend(struct.pack(">H", attr_count))
         if self.signature:
             _write_signature_attribute(cp, out, self.signature)
         if self.annotations:
             write_annotations_attribute(cp, out, "RuntimeVisibleAnnotations", self.annotations)
+        if self.constant_value is not None:
+            _write_constant_value_attribute(cp, out, self.constant_value)
 
 
 def _write_signature_attribute(cp: ConstantPool, out: bytearray, signature: str):
@@ -596,6 +601,27 @@ def _write_exceptions_attribute(cp: ConstantPool, out: bytearray, exceptions: li
     out.extend(struct.pack(">H", attr_name_idx))
     out.extend(struct.pack(">I", len(data)))
     out.extend(data)
+
+
+def _write_constant_value_attribute(cp: ConstantPool, out: bytearray, const: tuple[int, any]):
+    """Write a ConstantValue attribute from (tag, value)."""
+    attr_name_idx = cp.add_utf8("ConstantValue")
+    tag, value = const
+    if tag == ConstantPoolTag.INTEGER:
+        idx = cp.add_integer(int(value))
+    elif tag == ConstantPoolTag.LONG:
+        idx = cp.add_long(int(value))
+    elif tag == ConstantPoolTag.FLOAT:
+        idx = cp.add_float(float(value))
+    elif tag == ConstantPoolTag.DOUBLE:
+        idx = cp.add_double(float(value))
+    elif tag == ConstantPoolTag.STRING:
+        idx = cp.add_string(str(value))
+    else:
+        raise ValueError(f"Unsupported constant value tag: {tag}")
+    out.extend(struct.pack(">H", attr_name_idx))
+    out.extend(struct.pack(">I", 2))
+    out.extend(struct.pack(">H", idx))
 
 
 class ClassFile:
@@ -637,6 +663,19 @@ class ClassFile:
         for fld in self.fields:
             self.cp.add_utf8(fld.name)
             self.cp.add_utf8(fld.descriptor)
+            if fld.constant_value is not None:
+                self.cp.add_utf8("ConstantValue")
+                tag, val = fld.constant_value
+                if tag == ConstantPoolTag.INTEGER:
+                    self.cp.add_integer(int(val))
+                elif tag == ConstantPoolTag.LONG:
+                    self.cp.add_long(int(val))
+                elif tag == ConstantPoolTag.FLOAT:
+                    self.cp.add_float(float(val))
+                elif tag == ConstantPoolTag.DOUBLE:
+                    self.cp.add_double(float(val))
+                elif tag == ConstantPoolTag.STRING:
+                    self.cp.add_string(str(val))
 
         # Pre-add "Code" attribute name for methods with code
         if any(m.code for m in self.methods):

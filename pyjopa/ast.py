@@ -270,6 +270,15 @@ class Block(Statement):
 
 
 @dataclass(frozen=True)
+class ExplicitConstructorInvocation(Statement):
+    """Explicit constructor invocation: this(...) or super(...)."""
+    kind: str  # "this" or "super"
+    arguments: tuple["Expression", ...]
+    qualifier: Optional["Expression"] = None
+    type_arguments: tuple["Type", ...] = ()
+
+
+@dataclass(frozen=True)
 class LocalVariableDeclaration(Statement):
     """Local variable declaration."""
     modifiers: tuple[Modifier, ...]

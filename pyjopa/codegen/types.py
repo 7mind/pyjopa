@@ -87,6 +87,15 @@ class ResolvedMethod:
 
 
 @dataclass
+class ResolvedField:
+    """A resolved field from the classpath or current class."""
+    owner: str
+    descriptor: str
+    type: "JType"
+    is_static: bool
+
+
+@dataclass
 class LocalMethodInfo:
     """Info about a method defined in the current class."""
     name: str

@@ -500,18 +500,18 @@ type_arguments_or_diamond: type_arguments
                          | "<" ">"
 
 field_access: primary "." IDENTIFIER
-            | "super" "." IDENTIFIER
-            | type_name "." "super" "." IDENTIFIER
+            | "super" "." IDENTIFIER           -> field_access_super
+            | type_name "." "super" "." IDENTIFIER -> field_access_type_super
 
 array_access: expression_name "[" expression "]"
             | primary_no_new_array "[" expression "]"
 
 method_invocation: method_name "(" argument_list? ")"
-                 | type_name "." type_arguments? IDENTIFIER "(" argument_list? ")"
-                 | expression_name "." type_arguments? IDENTIFIER "(" argument_list? ")"
-                 | primary "." type_arguments? IDENTIFIER "(" argument_list? ")"
-                 | "super" "." type_arguments? IDENTIFIER "(" argument_list? ")"
-                 | type_name "." "super" "." type_arguments? IDENTIFIER "(" argument_list? ")"
+                 | type_name "." type_arguments? IDENTIFIER "(" argument_list? ")"           -> method_invocation_type
+                 | expression_name "." type_arguments? IDENTIFIER "(" argument_list? ")"     -> method_invocation_expr
+                 | primary "." type_arguments? IDENTIFIER "(" argument_list? ")"             -> method_invocation_primary
+                 | "super" "." type_arguments? IDENTIFIER "(" argument_list? ")"             -> method_invocation_super
+                 | type_name "." "super" "." type_arguments? IDENTIFIER "(" argument_list? ")" -> method_invocation_type_super
 
 argument_list: expression ("," expression)*
 
