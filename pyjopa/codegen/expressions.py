@@ -289,6 +289,56 @@ class ExpressionCompilerMixin:
         if op == "+" and self._is_string_concat(expr, ctx):
             return self.compile_string_concat(expr, ctx)
 
+        # Special handling for short-circuit operators - don't evaluate right if not needed
+        if op == "&&":
+            # Short-circuit AND: if left is false, result is false without evaluating right
+            false_label = self.new_label("false")
+            end_label = self.new_label("end")
+
+            # Compile and evaluate left operand
+            self.compile_expression(expr.left, ctx)
+            # If left is false (0), jump to false_label
+            builder.ifeq(false_label)
+
+            # Left is true, now evaluate right
+            self.compile_expression(expr.right, ctx)
+            # If right is false (0), jump to false_label
+            builder.ifeq(false_label)
+
+            # Both true
+            builder.iconst(1)
+            builder.goto(end_label)
+
+            # At least one false
+            builder.label(false_label)
+            builder.iconst(0)
+            builder.label(end_label)
+            return BOOLEAN
+        elif op == "||":
+            # Short-circuit OR: if left is true, result is true without evaluating right
+            true_label = self.new_label("true")
+            end_label = self.new_label("end")
+
+            # Compile and evaluate left operand
+            self.compile_expression(expr.left, ctx)
+            # If left is true (non-zero), jump to true_label
+            builder.ifne(true_label)
+
+            # Left is false, now evaluate right
+            self.compile_expression(expr.right, ctx)
+            # If right is true (non-zero), jump to true_label
+            builder.ifne(true_label)
+
+            # Both false
+            builder.iconst(0)
+            builder.goto(end_label)
+
+            # At least one true
+            builder.label(true_label)
+            builder.iconst(1)
+            builder.label(end_label)
+            return BOOLEAN
+
         left_type = self.compile_expression(expr.left, ctx)
         right_type = self.compile_expression(expr.right, ctx)
 
@@ -412,6 +462,15 @@ class ExpressionCompilerMixin:
                     builder.ifgt(true_label)
                 elif op == "<=":
                     builder.ifle(true_label)
+            else:
+                # Reference type comparison (Object, String, arrays, etc.)
+                # Only == and != are valid for reference types
+                if op == "==":
+                    builder.if_acmpeq(true_label)
+                elif op == "!=":
+                    builder.if_acmpne(true_label)
+                else:
+                    raise CompileError(f"Cannot use {op} on reference types")
 
             builder.iconst(0)
             builder.goto(end_label)

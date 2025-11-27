@@ -411,15 +411,18 @@ class CodeGenerator(
         )
         self.class_file.add_field(values_field)
 
-        # Compile methods from body
+        # Compile methods from body (except constructors - we handle those specially)
+        user_constructor = None
         for member in enum.body:
-            if isinstance(member, ast.MethodDeclaration):
+            if isinstance(member, ast.ConstructorDeclaration):
+                user_constructor = member
+            elif isinstance(member, ast.MethodDeclaration):
                 self.compile_method(member)
             elif isinstance(member, ast.FieldDeclaration):
                 self.compile_field(member)
 
-        # Generate private constructor: (String, int)
-        self._generate_enum_constructor(enum)
+        # Generate constructor with user parameters if provided
+        self._generate_enum_constructor(enum, user_constructor)
 
         # Generate static initializer that creates enum constants
         self._generate_enum_static_initializer(enum)
@@ -432,8 +435,8 @@ class CodeGenerator(
 
         return self.class_file.to_bytes()
 
-    def _generate_enum_constructor(self, enum: ast.EnumDeclaration):
-        """Generate private constructor for enum: (String name, int ordinal)"""
+    def _generate_enum_constructor(self, enum: ast.EnumDeclaration, user_constructor: Optional[ast.MethodDeclaration] = None):
+        """Generate private constructor for enum with user parameters if provided."""
         builder = BytecodeBuilder(self.class_file.cp)
         ctx = MethodContext(
             class_name=self.class_name,
@@ -442,10 +445,21 @@ class CodeGenerator(
             builder=builder,
         )
 
-        # this, name, ordinal
+        # this, name, ordinal (always present)
         ctx.add_local("this", ClassJType(self.class_name))
         ctx.add_local("name", ClassJType("java/lang/String"))
         ctx.add_local("ordinal", INT)
+
+        # Build descriptor with user parameters
+        descriptor_parts = ["Ljava/lang/String;", "I"]
+        if user_constructor:
+            # Add user parameters to context and descriptor
+            for param in user_constructor.parameters:
+                param_type = self.resolve_type(param.type)
+                ctx.add_local(param.name, param_type)
+                descriptor_parts.append(param_type.descriptor())
+
+        descriptor = f"({''.join(descriptor_parts)})V"
 
         # Call super(String, int)
         builder.aload(0)  # this
@@ -453,12 +467,17 @@ class CodeGenerator(
         builder.iload(2)  # ordinal
         builder.invokespecial("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", 3, 0)
 
+        # Compile user constructor body if provided
+        if user_constructor and user_constructor.body:
+            for stmt in user_constructor.body.statements:
+                self.compile_statement(stmt, ctx)
+
         builder.return_()
 
         method_info = MethodInfo(
             access_flags=AccessFlags.PRIVATE,
             name="<init>",
-            descriptor="(Ljava/lang/String;I)V",
+            descriptor=descriptor,
             code=builder.build(),
         )
         self.class_file.add_method(method_info)
@@ -475,12 +494,22 @@ class CodeGenerator(
 
         # Create each enum constant
         for ordinal, const in enumerate(enum.constants):
-            # new EnumName("CONST_NAME", ordinal)
+            # new EnumName("CONST_NAME", ordinal, ...user_args)
             builder.new(self.class_name)
             builder.dup()
             builder.ldc_string(const.name)
             builder.iconst(ordinal)
-            builder.invokespecial(self.class_name, "<init>", "(Ljava/lang/String;I)V", 3, 0)
+
+            # Compile user arguments
+            descriptor_parts = ["Ljava/lang/String;", "I"]
+            args_slots = 3  # this + name + ordinal
+            for arg in const.arguments:
+                arg_type = self.compile_expression(arg, ctx)
+                descriptor_parts.append(arg_type.descriptor())
+                args_slots += arg_type.size
+
+            descriptor = f"({''.join(descriptor_parts)})V"
+            builder.invokespecial(self.class_name, "<init>", descriptor, args_slots, 0)
             # Store in static field
             builder.putstatic(self.class_name, const.name, f"L{self.class_name};")
 

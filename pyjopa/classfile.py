@@ -856,6 +856,9 @@ class BytecodeBuilder:
 
     def _pop(self, count: int = 1):
         self._current_stack -= count
+        if self._current_stack < 0:
+            # Stack underflow - reset to 0 to avoid corruption
+            self._current_stack = 0
 
     def position(self) -> int:
         return len(self.code)

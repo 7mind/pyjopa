@@ -88,6 +88,34 @@ class BoxingMixin:
             return self.emit_boxing(source_type, builder)
         elif self.needs_unboxing(source_type, target_type):
             return self.emit_unboxing(source_type, builder)
+        # Handle primitive widening conversions
+        elif isinstance(source_type, PrimitiveJType) and isinstance(target_type, PrimitiveJType):
+            if source_type == target_type:
+                return source_type
+            # Emit widening conversion instruction
+            if source_type == INT:
+                if target_type == LONG:
+                    builder.i2l()
+                    return LONG
+                elif target_type == FLOAT:
+                    builder.i2f()
+                    return FLOAT
+                elif target_type == DOUBLE:
+                    builder.i2d()
+                    return DOUBLE
+            elif source_type == LONG:
+                if target_type == FLOAT:
+                    builder.l2f()
+                    return FLOAT
+                elif target_type == DOUBLE:
+                    builder.l2d()
+                    return DOUBLE
+            elif source_type == FLOAT:
+                if target_type == DOUBLE:
+                    builder.f2d()
+                    return DOUBLE
+            # No conversion needed or not a valid widening conversion
+            return source_type
         # Box primitive to reference type if needed
         elif isinstance(source_type, PrimitiveJType) and isinstance(target_type, ClassJType):
             # Box the primitive to its wrapper
