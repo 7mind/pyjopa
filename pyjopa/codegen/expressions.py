@@ -58,6 +58,15 @@ class ExpressionCompilerMixin:
                     builder.aload(0)
                     builder.getfield(field.owner, expr.name, field.descriptor)
                 return field.type
+            # For inner classes, check outer class fields
+            if hasattr(self, 'is_inner_class') and self.is_inner_class and hasattr(self, 'outer_class_name'):
+                outer_field = self._find_field(self.outer_class_name, expr.name)
+                if outer_field:
+                    # Access via this$0
+                    builder.aload(0)  # load this
+                    builder.getfield(self.class_name, "this$0", f"L{self.outer_class_name};")  # load this$0
+                    builder.getfield(self.outer_class_name, expr.name, outer_field.descriptor)
+                    return outer_field.type
             raise CompileError(f"Undefined variable: {expr.name}")
 
         elif isinstance(expr, ast.ParenthesizedExpression):
@@ -984,9 +993,13 @@ class ExpressionCompilerMixin:
                 self.compile_expression(arg, ctx)  # push value
                 self._emit_array_store(elem_type, builder)
         else:
-            # Normal argument compilation
-            for arg in expr.arguments:
-                self.compile_expression(arg, ctx)
+            # Normal argument compilation with conversions
+            for i, arg in enumerate(expr.arguments):
+                arg_type = self.compile_expression(arg, ctx)
+                # Apply conversion if needed (boxing, checkcast)
+                if i < len(resolved.param_types):
+                    param_type = resolved.param_types[i]
+                    self.emit_conversion(arg_type, param_type, builder)
 
         # Calculate stack effect
         args_slots = sum(t.size for t in resolved.param_types)
@@ -1089,9 +1102,22 @@ class ExpressionCompilerMixin:
 
             return current_type
 
-        # For other qualified names, they might be class names or package paths
-        # For now, just return a ClassJType for the full path
-        full_name = "/".join(expr.parts)
+        # Handle static field access (e.g., ClassName.FIELD or package.Class.FIELD)
+        # Try different splits to find class name + field name
+        for i in range(len(expr.parts) - 1, 0, -1):
+            potential_class = ".".join(expr.parts[:i])
+            field_name = expr.parts[i]
+
+            # Try to resolve as a class name
+            class_internal = self._resolve_class_name(potential_class)
+            field = self._find_field(class_internal, field_name)
+
+            if field and field.is_static:
+                builder.getstatic(field.owner, field_name, field.descriptor)
+                return field.type
+
+        # If no static field found, might be a class name or type
+        full_name = ".".join(expr.parts)
         return ClassJType(full_name)
 
     def compile_ternary(self, expr: ast.ConditionalExpression, ctx: MethodContext) -> JType:
@@ -1216,21 +1242,66 @@ class ExpressionCompilerMixin:
             if self.class_file.access_flags & AccessFlags.ABSTRACT:
                 raise CompileError(f"Cannot instantiate abstract class {type_name}")
 
+        # Check if this is an inner class (has this$0 field)
+        is_inner_class = False
+        outer_class_type = None
+        if cls_info and hasattr(cls_info, 'fields'):
+            for field in cls_info.fields:
+                if field.name == "this$0":
+                    is_inner_class = True
+                    # Extract outer class name from descriptor (e.g., "LOuterClass;" -> "OuterClass")
+                    outer_class_type = ClassJType(field.descriptor[1:-1])
+                    break
+
         # new ClassName
         builder.new(type_name)
         builder.dup()
 
-        # Compile constructor arguments
-        arg_types = []
+        # Estimate argument types for constructor resolution
+        arg_types_estimate = []
+        if is_inner_class:
+            arg_types_estimate.append(ClassJType(self.class_name))
+        for arg in expr.arguments:
+            arg_type = self._estimate_expression_type(arg, ctx) if hasattr(self, '_estimate_expression_type') else None
+            if arg_type:
+                arg_types_estimate.append(arg_type)
+
+        # Find the actual constructor (handles type erasure for generics)
+        constructor = None
+        if arg_types_estimate:
+            constructor = self._find_constructor(type_name, arg_types_estimate)
+
+        # For inner classes, evaluate and pass qualifier (outer instance)
+        arg_idx = 0
+        if is_inner_class:
+            if expr.qualifier:
+                # Qualified allocation: outer.new Inner()
+                qualifier_type = self.compile_expression(expr.qualifier, ctx)
+            else:
+                # Unqualified allocation from within outer class: new Inner()
+                # Use 'this' as the outer instance
+                builder.aload(0)  # load this
+            arg_idx += 1
+
+        # Compile constructor arguments with conversions
         for arg in expr.arguments:
             arg_type = self.compile_expression(arg, ctx)
-            arg_types.append(arg_type)
+            # Apply conversion if we resolved the constructor
+            if constructor and arg_idx < len(constructor.param_types):
+                param_type = constructor.param_types[arg_idx]
+                arg_type = self.emit_conversion(arg_type, param_type, builder)
+            arg_idx += 1
 
-        # Build descriptor for constructor
-        desc = "(" + "".join(t.descriptor() for t in arg_types) + ")V"
+        # Use resolved descriptor or build from types
+        if constructor:
+            desc = constructor.descriptor
+            args_slots = sum(t.size for t in constructor.param_types)
+        else:
+            # Fallback: build descriptor from argument types (estimate)
+            desc = "(" + "".join(t.descriptor() for t in arg_types_estimate) + ")V"
+            args_slots = sum(t.size for t in arg_types_estimate)
 
         # Invoke constructor
-        args_slots = sum(t.size for t in arg_types)
         builder.invokespecial(type_name, "<init>", desc, args_slots, 0)
 
         return ClassJType(type_name)

@@ -624,6 +624,15 @@ def _write_constant_value_attribute(cp: ConstantPool, out: bytearray, const: tup
     out.extend(struct.pack(">H", idx))
 
 
+@dataclass
+class InnerClassInfo:
+    """Represents an entry in the InnerClasses attribute."""
+    inner_class: str  # Internal name like "Outer$Inner"
+    outer_class: Optional[str]  # Internal name like "Outer", None for anonymous/local
+    inner_name: Optional[str]  # Simple name like "Inner", None for anonymous
+    access_flags: int  # Access flags for the inner class
+
+
 class ClassFile:
     """Represents a Java class file."""
 
@@ -641,6 +650,7 @@ class ClassFile:
         self.cp = ConstantPool()
         self.signature: Optional[str] = None
         self.annotations: list[AnnotationInfo] = []
+        self.inner_classes: list[InnerClassInfo] = []
 
     def add_method(self, method: MethodInfo):
         self.methods.append(method)
@@ -738,6 +748,16 @@ class ClassFile:
                     for ann in param_anns:
                         self.cp.add_utf8(ann.type_descriptor)
 
+        # Pre-add "InnerClasses" attribute name and class names
+        if self.inner_classes:
+            self.cp.add_utf8("InnerClasses")
+            for ic in self.inner_classes:
+                self.cp.add_class(ic.inner_class)
+                if ic.outer_class:
+                    self.cp.add_class(ic.outer_class)
+                if ic.inner_name:
+                    self.cp.add_utf8(ic.inner_name)
+
         # Magic number
         out.extend(struct.pack(">I", self.MAGIC))
 
@@ -777,13 +797,40 @@ class ClassFile:
             attr_count += 1
         if self.annotations:
             attr_count += 1
+        if self.inner_classes:
+            attr_count += 1
         out.extend(struct.pack(">H", attr_count))
         if self.signature:
             _write_signature_attribute(self.cp, out, self.signature)
         if self.annotations:
             write_annotations_attribute(self.cp, out, "RuntimeVisibleAnnotations", self.annotations)
+        if self.inner_classes:
+            self._write_inner_classes_attribute(self.cp, out)
 
         return bytes(out)
+
+    def _write_inner_classes_attribute(self, cp: ConstantPool, out: bytearray):
+        """Write the InnerClasses attribute."""
+        attr_name_idx = cp.add_utf8("InnerClasses")
+        out.extend(struct.pack(">H", attr_name_idx))
+
+        # Attribute length: 2 (number_of_classes) + 8 * number_of_classes
+        attr_len = 2 + 8 * len(self.inner_classes)
+        out.extend(struct.pack(">I", attr_len))
+
+        # Number of classes
+        out.extend(struct.pack(">H", len(self.inner_classes)))
+
+        # Write each inner class entry
+        for ic in self.inner_classes:
+            inner_class_idx = cp.add_class(ic.inner_class)
+            outer_class_idx = cp.add_class(ic.outer_class) if ic.outer_class else 0
+            inner_name_idx = cp.add_utf8(ic.inner_name) if ic.inner_name else 0
+
+            out.extend(struct.pack(">H", inner_class_idx))
+            out.extend(struct.pack(">H", outer_class_idx))
+            out.extend(struct.pack(">H", inner_name_idx))
+            out.extend(struct.pack(">H", ic.access_flags))
 
     def write(self, path: str):
         with open(path, "wb") as f:
@@ -889,6 +936,16 @@ class BytecodeBuilder:
 
     def ldc_string(self, value: str):
         idx = self.cp.add_string(value)
+        if idx <= 255:
+            self._emit(Opcode.LDC, idx)
+        else:
+            self._emit(Opcode.LDC_W)
+            self.code.extend(struct.pack(">H", idx))
+        self._push()
+
+    def ldc_class(self, class_name: str):
+        """Load a class constant (Class<?> object) onto the stack."""
+        idx = self.cp.add_class(class_name)
         if idx <= 255:
             self._emit(Opcode.LDC, idx)
         else:
@@ -1268,6 +1325,13 @@ class BytecodeBuilder:
         self.code.extend(struct.pack(">H", idx))
         self._pop()
         self._push()
+
+    def checkcast(self, class_name: str):
+        """Cast reference to a class type. Pops reference, pushes same reference (typed)."""
+        idx = self.cp.add_class(class_name)
+        self._emit(Opcode.CHECKCAST)
+        self.code.extend(struct.pack(">H", idx))
+        # Stack stays the same (pop ref, push ref)
 
     def newarray(self, atype: int):
         """Create new primitive array. atype: T_BOOLEAN=4, T_CHAR=5, T_FLOAT=6, T_DOUBLE=7, T_BYTE=8, T_SHORT=9, T_INT=10, T_LONG=11"""

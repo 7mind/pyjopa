@@ -139,13 +139,16 @@ class SignatureMixin:
 
     def _generate_type_argument_signature(self, ta) -> str:
         """Generate signature for a type argument."""
-        if isinstance(ta, ast.WildcardType):
-            if ta.extends:
-                return "+" + self._generate_type_signature(ta.extends)
-            elif ta.super_:
-                return "-" + self._generate_type_signature(ta.super_)
+        if isinstance(ta, ast.TypeArgument):
+            if ta.wildcard == "extends" and ta.type:
+                return "+" + self._generate_type_signature(ta.type)
+            elif ta.wildcard == "super" and ta.type:
+                return "-" + self._generate_type_signature(ta.type)
+            elif ta.wildcard and not ta.type:
+                return "*"  # Unbounded wildcard
             else:
-                return "*"
+                # Regular type argument
+                return self._generate_type_signature(ta.type) if ta.type else "*"
         else:
             return self._generate_type_signature(ta)
 
@@ -216,10 +219,7 @@ class SignatureMixin:
             return False
         elif isinstance(type_node, ast.ArrayType):
             return self._type_uses_generics(type_node.element_type, type_params)
-        elif isinstance(type_node, ast.WildcardType):
-            if type_node.extends and self._type_uses_generics(type_node.extends, type_params):
-                return True
-            if type_node.super_ and self._type_uses_generics(type_node.super_, type_params):
-                return True
-            return False
+        elif isinstance(type_node, ast.TypeArgument):
+            # Wildcards always require signature generation
+            return True
         return False

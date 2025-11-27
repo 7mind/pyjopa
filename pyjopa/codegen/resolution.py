@@ -28,16 +28,72 @@ class ResolutionMixin:
     
     def _resolve_class_name(self, name: str) -> str:
         """Resolve a simple class name to its full internal name."""
-        # Already qualified
-        if "/" in name or "." in name:
+        # Already qualified with /
+        if "/" in name:
+            return name
+
+        # Handle dotted names (could be package.Class or Outer.Inner)
+        if "." in name:
+            parts = name.split(".")
+            # Try to resolve as nested class: check if first part is a known class
+            first_part = parts[0]
+            resolved_first = self._resolve_class_name(first_part)
+
+            # Check if this is a known class
+            # Also check if it's the base class currently being compiled (for nested classes)
+            base_class_name = self.class_name.split("$")[0]
+            is_base_class = (resolved_first == base_class_name)
+            lookup_result = self._lookup_class(resolved_first)
+            if lookup_result or is_base_class:
+                # It's a nested class: Outer.Inner becomes Outer$Inner
+                result = resolved_first
+                for part in parts[1:]:
+                    result = f"{result}${part}"
+                return result
+
+            # Not a nested class, treat as package path
             return name.replace(".", "/")
+
         # Check if it's a java.lang class
         if name in JAVA_LANG_CLASSES:
             return f"java/lang/{name}"
-        # Check if it's the current class
-        if name == self.class_name or name == self.class_name.split("/")[-1]:
+        # Check if it's the current class (exact match)
+        if name == self.class_name:
             return self.class_name
-        # Otherwise assume it's in the default package or same package
+        # Check if it's the base class name (for nested classes)
+        base_class_name = self.class_name.split("/")[-1].split("$")[0]
+        if name == base_class_name:
+            return base_class_name
+        # Check if it's a nested class of the current outer class
+        # When we're in Outer or Outer$Inner, and we see "Inner", check if Outer$Inner exists
+        if "$" in self.class_name:
+            # We're in a nested class, get the outermost class
+            outer_class = self.class_name.split("$")[0]
+        else:
+            # We're in the outer class
+            outer_class = self.class_name
+        potential_nested = f"{outer_class}${name}"
+        if self._lookup_class(potential_nested):
+            return potential_nested
+
+        # Check single-type imports
+        if hasattr(self, '_single_type_imports') and name in self._single_type_imports:
+            return self._single_type_imports[name]
+
+        # Check wildcard imports
+        if hasattr(self, '_wildcard_imports'):
+            for package in self._wildcard_imports:
+                candidate = f"{package}/{name}"
+                if self._lookup_class(candidate):
+                    return candidate
+
+        # Check same package (current package)
+        if hasattr(self, '_current_package') and self._current_package:
+            same_package_candidate = f"{self._current_package}/{name}"
+            if self._lookup_class(same_package_candidate):
+                return same_package_candidate
+
+        # Otherwise assume it's in the default package
         return name
 
     def new_label(self, prefix: str = "L") -> str:
@@ -60,6 +116,10 @@ class ResolutionMixin:
         """Find a method in a class that matches the given name and argument types."""
         # Check if looking in the current class being compiled
         if class_name == self.class_name and method_name in self._local_methods:
+            # Check if current class is an interface
+            is_current_interface = hasattr(self, 'class_file') and (
+                self.class_file.access_flags & AccessFlags.INTERFACE
+            )
             for local_method in self._local_methods[method_name]:
                 # Exact match
                 if len(local_method.param_types) == len(arg_types):
@@ -68,7 +128,7 @@ class ResolutionMixin:
                         name=method_name,
                         descriptor=local_method.descriptor,
                         is_static=local_method.is_static,
-                        is_interface=False,
+                        is_interface=is_current_interface,
                         return_type=local_method.return_type,
                         param_types=local_method.param_types,
                         is_varargs=local_method.is_varargs,
@@ -99,7 +159,7 @@ class ResolutionMixin:
                                         name=method_name,
                                         descriptor=local_method.descriptor,
                                         is_static=local_method.is_static,
-                                        is_interface=False,
+                                        is_interface=is_current_interface,
                                         return_type=local_method.return_type,
                                         param_types=local_method.param_types,
                                         is_varargs=True,
@@ -198,6 +258,9 @@ class ResolutionMixin:
         if isinstance(to_type, ClassJType) and to_type.internal_name() == "java/lang/Object":
             if isinstance(from_type, (ClassJType, ArrayJType)):
                 return True
+            # Boxing: primitives can be boxed to their wrapper, which is assignable to Object
+            if isinstance(from_type, PrimitiveJType):
+                return True
 
         # Subtyping for reference types (simplified - just check if same or Object)
         if isinstance(from_type, ClassJType) and isinstance(to_type, ClassJType):
@@ -205,6 +268,18 @@ class ResolutionMixin:
                 return True
             if self._is_subclass(from_type.internal_name(), to_type.internal_name()):
                 return True
+
+        # Boxing: check if from_type can be boxed to to_type's wrapper
+        if isinstance(from_type, PrimitiveJType) and isinstance(to_type, ClassJType):
+            from ..codegen.types import BOXING_MAP
+            from_desc = from_type.descriptor()
+            if from_desc in BOXING_MAP:
+                wrapper_class = BOXING_MAP[from_desc][0]
+                if to_type.internal_name() == wrapper_class:
+                    return True
+                # Also check if wrapper is assignable to to_type (e.g., Integer → Number)
+                if self._is_subclass(wrapper_class, to_type.internal_name()):
+                    return True
 
         return False
 
@@ -438,7 +513,7 @@ class ResolutionMixin:
         return jtype
 
     def resolve_type(self, t: ast.Type) -> JType:
-        """Resolve an AST type to a JType."""
+        """Resolve an AST type to a JType with type erasure for generics."""
         if isinstance(t, ast.PrimitiveType):
             if t.name in PRIMITIVE_TYPES:
                 return PRIMITIVE_TYPES[t.name]
@@ -448,6 +523,17 @@ class ResolutionMixin:
             # Handle void (may come through as ClassType in some cases)
             if t.name == "void":
                 return VOID
+
+            # Type erasure: if this is a type parameter, return its erasure
+            if hasattr(self, '_type_params') and t.name in self._type_params:
+                type_param = self._type_params[t.name]
+                if type_param.bounds:
+                    # Erase to first bound
+                    return self.resolve_type(type_param.bounds[0])
+                else:
+                    # Erase to Object
+                    return ClassJType("java/lang/Object")
+
             # Resolve class name (handles java.lang.* auto-import)
             resolved_name = self._resolve_class_name(t.name)
             return ClassJType(resolved_name)

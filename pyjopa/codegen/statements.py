@@ -62,7 +62,9 @@ class StatementCompilerMixin:
 
         elif isinstance(stmt, ast.ReturnStatement):
             if stmt.expression:
-                self.compile_expression(stmt.expression, ctx)
+                expr_type = self.compile_expression(stmt.expression, ctx)
+                # Apply conversion if needed (checkcast for generics, boxing/unboxing)
+                self.emit_conversion(expr_type, ctx.return_type, builder)
                 if ctx.return_type == VOID:
                     builder.return_()
                 elif ctx.return_type == INT or ctx.return_type == BOOLEAN:
@@ -223,10 +225,153 @@ class StatementCompilerMixin:
             self._compile_switch(stmt, ctx)
 
         elif isinstance(stmt, ast.BreakStatement):
-            builder.goto(ctx.get_break_label())
+            builder.goto(ctx.get_break_label(stmt.label))
 
         elif isinstance(stmt, ast.ContinueStatement):
-            builder.goto(ctx.get_continue_label())
+            builder.goto(ctx.get_continue_label(stmt.label))
+
+        elif isinstance(stmt, ast.LabeledStatement):
+            # Determine what kind of statement is labeled
+            inner = stmt.statement
+
+            # Check if the labeled statement is a loop
+            is_loop = isinstance(inner, (ast.WhileStatement, ast.DoWhileStatement, ast.ForStatement, ast.EnhancedForStatement))
+
+            if is_loop:
+                # For loops, we need to track both break and continue labels
+                # We'll compile the loop and register the label with its labels
+                # This requires modifying how we compile loops to allow label registration
+
+                if isinstance(inner, ast.WhileStatement):
+                    loop_label = self.new_label("while")
+                    end_label = self.new_label("endwhile")
+
+                    ctx.register_label(stmt.label, end_label, loop_label)
+
+                    builder.label(loop_label)
+                    self.compile_condition(inner.condition, ctx, end_label, False)
+                    ctx.push_loop(end_label, loop_label)
+                    self.compile_statement(inner.body, ctx)
+                    ctx.pop_loop()
+                    builder.goto(loop_label)
+                    builder.label(end_label)
+
+                    ctx.unregister_label(stmt.label)
+
+                elif isinstance(inner, ast.DoWhileStatement):
+                    loop_label = self.new_label("do")
+                    end_label = self.new_label("enddo")
+
+                    ctx.register_label(stmt.label, end_label, loop_label)
+
+                    builder.label(loop_label)
+                    ctx.push_loop(end_label, loop_label)
+                    self.compile_statement(inner.body, ctx)
+                    ctx.pop_loop()
+                    self.compile_condition(inner.condition, ctx, loop_label, True)
+                    builder.label(end_label)
+
+                    ctx.unregister_label(stmt.label)
+
+                elif isinstance(inner, ast.ForStatement):
+                    loop_label = self.new_label("for")
+                    end_label = self.new_label("endfor")
+                    update_label = self.new_label("update")
+
+                    ctx.register_label(stmt.label, end_label, update_label)
+
+                    # Init
+                    if inner.init:
+                        if isinstance(inner.init, ast.LocalVariableDeclaration):
+                            self.compile_statement(inner.init, ctx)
+                        else:
+                            for expr in inner.init:
+                                expr_type = self.compile_expression(expr, ctx)
+                                if expr_type != VOID:
+                                    builder.pop()
+
+                    builder.label(loop_label)
+
+                    # Condition
+                    if inner.condition:
+                        self.compile_condition(inner.condition, ctx, end_label, False)
+
+                    # Body
+                    ctx.push_loop(end_label, update_label)
+                    self.compile_statement(inner.body, ctx)
+                    ctx.pop_loop()
+
+                    builder.label(update_label)
+
+                    # Update
+                    if inner.update:
+                        for expr in inner.update:
+                            expr_type = self.compile_expression(expr, ctx)
+                            if expr_type != VOID:
+                                builder.pop()
+
+                    builder.goto(loop_label)
+                    builder.label(end_label)
+
+                    ctx.unregister_label(stmt.label)
+
+                elif isinstance(inner, ast.EnhancedForStatement):
+                    loop_label = self.new_label("foreach")
+                    end_label = self.new_label("endforeach")
+                    update_label = self.new_label("update")
+
+                    ctx.register_label(stmt.label, end_label, update_label)
+
+                    # Compile the iterable expression
+                    arr_type = self.compile_expression(inner.iterable, ctx)
+                    if not isinstance(arr_type, ArrayJType):
+                        raise CompileError(f"Enhanced for requires array type, got {arr_type}")
+                    elem_type = arr_type.element_type
+
+                    # Store array in temp
+                    arr_var = ctx.add_local(f"$arr_{self.new_label()}", arr_type)
+                    self.store_local(arr_var, builder)
+
+                    # Index variable: int $i = 0
+                    idx_var = ctx.add_local(f"$i_{self.new_label()}", INT)
+                    builder.iconst(0)
+                    self.store_local(idx_var, builder)
+
+                    # Loop: while ($i < $arr.length)
+                    builder.label(loop_label)
+                    self.load_local(idx_var, builder)
+                    self.load_local(arr_var, builder)
+                    builder.arraylength()
+                    builder.if_icmpge(end_label)
+
+                    # T x = $arr[$i]
+                    elem_var_type = self.resolve_type(inner.type)
+                    elem_var = ctx.add_local(inner.name, elem_var_type)
+                    self.load_local(arr_var, builder)
+                    self.load_local(idx_var, builder)
+                    self._emit_array_load(elem_type, builder)
+                    self.store_local(elem_var, builder)
+
+                    # Body
+                    ctx.push_loop(end_label, update_label)
+                    self.compile_statement(inner.body, ctx)
+                    ctx.pop_loop()
+
+                    # $i++
+                    builder.label(update_label)
+                    builder.iinc(idx_var.slot, 1)
+                    builder.goto(loop_label)
+
+                    builder.label(end_label)
+
+                    ctx.unregister_label(stmt.label)
+            else:
+                # For non-loop statements, only break is allowed (continue is not)
+                end_label = self.new_label("endlabel")
+                ctx.register_label(stmt.label, end_label, None)
+                self.compile_statement(inner, ctx)
+                builder.label(end_label)
+                ctx.unregister_label(stmt.label)
 
         elif isinstance(stmt, ast.TryStatement):
             self._compile_try(stmt, ctx)

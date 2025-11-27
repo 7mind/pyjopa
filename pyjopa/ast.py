@@ -85,8 +85,13 @@ class Modifier(ASTNode):
     annotation: Optional[Annotation]
 
 
-class TypeDeclaration(ASTNode):
-    """Base class for type declarations."""
+class ClassBodyDeclaration(ASTNode):
+    """Base for class body declarations."""
+    pass
+
+
+class TypeDeclaration(ClassBodyDeclaration):
+    """Base class for type declarations (can also be nested in classes)."""
     pass
 
 

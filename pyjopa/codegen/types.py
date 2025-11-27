@@ -41,6 +41,7 @@ class MethodContext:
     next_slot: int = 0
     loop_stack: list[LoopContext] = field(default_factory=list)
     switch_break_label: Optional[str] = None
+    label_map: dict[str, tuple[str, Optional[str]]] = field(default_factory=dict)  # label -> (break_label, continue_label or None)
 
     def push_loop(self, break_label: str, continue_label: str):
         self.loop_stack.append(LoopContext(break_label, continue_label))
@@ -48,14 +49,34 @@ class MethodContext:
     def pop_loop(self):
         self.loop_stack.pop()
 
-    def get_break_label(self) -> str:
+    def register_label(self, label: str, break_label: str, continue_label: Optional[str] = None):
+        """Register a labeled statement."""
+        self.label_map[label] = (break_label, continue_label)
+
+    def unregister_label(self, label: str):
+        """Remove a label from the map."""
+        if label in self.label_map:
+            del self.label_map[label]
+
+    def get_break_label(self, label: Optional[str] = None) -> str:
+        if label:
+            if label not in self.label_map:
+                raise CompileError(f"Label not found: {label}")
+            return self.label_map[label][0]
         if self.switch_break_label:
             return self.switch_break_label
         if not self.loop_stack:
             raise CompileError("break outside of loop or switch")
         return self.loop_stack[-1].break_label
 
-    def get_continue_label(self) -> str:
+    def get_continue_label(self, label: Optional[str] = None) -> str:
+        if label:
+            if label not in self.label_map:
+                raise CompileError(f"Label not found: {label}")
+            continue_label = self.label_map[label][1]
+            if continue_label is None:
+                raise CompileError(f"Cannot continue to non-loop label: {label}")
+            return continue_label
         if not self.loop_stack:
             raise CompileError("continue outside of loop")
         return self.loop_stack[-1].continue_label

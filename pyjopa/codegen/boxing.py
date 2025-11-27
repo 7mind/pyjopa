@@ -88,5 +88,30 @@ class BoxingMixin:
             return self.emit_boxing(source_type, builder)
         elif self.needs_unboxing(source_type, target_type):
             return self.emit_unboxing(source_type, builder)
+        # Box primitive to reference type if needed
+        elif isinstance(source_type, PrimitiveJType) and isinstance(target_type, ClassJType):
+            # Box the primitive to its wrapper
+            boxed_type = self.emit_boxing(source_type, builder)
+            # Then checkcast to target if needed
+            if boxed_type.internal_name() != target_type.internal_name():
+                builder.checkcast(target_type.internal_name())
+                return target_type
+            return boxed_type
+        elif self._needs_checkcast(source_type, target_type):
+            builder.checkcast(target_type.internal_name())
+            return target_type
         return source_type
+
+    def _needs_checkcast(self, source_type: JType, target_type: JType) -> bool:
+        """Check if a checkcast is needed from source to target."""
+        # Skip if same type
+        if source_type == target_type:
+            return False
+        # Skip primitives
+        if not isinstance(source_type, ClassJType) or not isinstance(target_type, ClassJType):
+            return False
+        # Need checkcast if source is Object or a supertype of target
+        # For simplicity, if they're different reference types, we need checkcast
+        # (proper implementation would check the class hierarchy)
+        return True
 

@@ -153,7 +153,7 @@ class Java8Transformer(Transformer):
                 extends = item
             elif isinstance(item, tuple) and item and isinstance(item[0], ast.Type):
                 implements = item
-            elif isinstance(item, tuple) and (not item or isinstance(item[0], ast.ClassBodyDeclaration)):
+            elif isinstance(item, tuple) and (not item or isinstance(item[0], (ast.ClassBodyDeclaration, ast.TypeDeclaration))):
                 body = item
 
         return ast.ClassDeclaration(
@@ -177,7 +177,7 @@ class Java8Transformer(Transformer):
     def class_body(self, items):
         declarations = []
         for item in items:
-            if isinstance(item, ast.ClassBodyDeclaration):
+            if isinstance(item, (ast.ClassBodyDeclaration, ast.TypeDeclaration)):
                 declarations.append(item)
         return tuple(declarations)
 
@@ -870,6 +870,19 @@ class Java8Transformer(Transformer):
                 var_type = item
             elif isinstance(item, tuple) and item and isinstance(item[0], ast.VariableDeclarator):
                 declarators = item
+
+        # Detect misparsed break/continue statements
+        # Due to grammar ambiguity, "break label;" can be parsed as a variable declaration
+        # where "break" is the type and "label" is the variable name
+        if (not modifiers and var_type and isinstance(var_type, ast.ClassType) and
+            len(declarators) == 1 and declarators[0].dimensions == 0 and
+            declarators[0].initializer is None):
+            type_name = var_type.name
+            label = declarators[0].name
+            if type_name == "break":
+                return ast.BreakStatement(label=label)
+            elif type_name == "continue":
+                return ast.ContinueStatement(label=label)
 
         return ast.LocalVariableDeclaration(
             modifiers=tuple(modifiers),
@@ -1619,9 +1632,29 @@ class Java8Transformer(Transformer):
         return ast.ClassLiteral(type=ast.PrimitiveType(name="void"))
 
     def class_instance_creation_expression(self, items):
+        # Can be: unqualified_class_instance_creation
+        # Or: expression "." unqualified_class_instance_creation
+        # Or: primary "." unqualified_class_instance_creation
+        qualifier = None
+        new_instance = None
+
         for item in items:
             if isinstance(item, ast.NewInstance):
-                return item
+                new_instance = item
+            elif isinstance(item, ast.Expression):
+                qualifier = item
+
+        if new_instance and qualifier:
+            # Qualified allocation: outer.new Inner()
+            return ast.NewInstance(
+                qualifier=qualifier,
+                type_arguments=new_instance.type_arguments,
+                type=new_instance.type,
+                arguments=new_instance.arguments,
+                body=new_instance.body
+            )
+        elif new_instance:
+            return new_instance
         return None
 
     def unqualified_class_instance_creation(self, items):

@@ -11,6 +11,7 @@ from ..types import (
 from ..classfile import (
     ClassFile, MethodInfo, FieldInfo, CodeAttribute, BytecodeBuilder,
     AccessFlags, AnnotationInfo, ExceptionTableEntry, ConstantPoolTag,
+    ClassFileVersion,
 )
 from ..classreader import ClassPath, ClassInfo as ReadClassInfo, ClassReader
 
@@ -46,6 +47,9 @@ class CodeGenerator(
         self._local_methods: dict[str, list[LocalMethodInfo]] = {}  # method_name -> list of overloads
         self._static_init_sequence: list[tuple[str, any]] = []  # ("field", name, expr) or ("block", block)
         self._instance_init_sequence: list[tuple[str, any]] = []  # ("field", name, expr) or ("block", block)
+        self._single_type_imports: dict[str, str] = {}  # short name -> full name
+        self._wildcard_imports: list[str] = []  # list of package prefixes
+        self._current_package: str = ""  # current package as internal name (e.g., "com/example")
 
     def new_label(self, prefix: str = "L") -> str:
         self._label_counter += 1
@@ -80,10 +84,22 @@ class CodeGenerator(
     def _register_local_method(self, method: ast.MethodDeclaration):
         """Register a method for forward reference resolution."""
         is_static = any(m.keyword == "static" for m in method.modifiers)
+
+        # Set up method type parameters for type erasure
+        saved_type_params = self._type_params.copy() if hasattr(self, '_type_params') else {}
+        if not hasattr(self, '_type_params'):
+            self._type_params = {}
+        for tp in method.type_parameters:
+            self._type_params[tp.name] = tp
+
+        # Now resolve types with erasure
         return_type = self.resolve_type(method.return_type)
         param_types = tuple(self._resolve_parameter_type(p) for p in method.parameters)
         descriptor = MethodType(return_type, param_types).descriptor()
         is_varargs = bool(method.parameters and method.parameters[-1].varargs)
+
+        # Restore type parameters
+        self._type_params = saved_type_params
 
         info = LocalMethodInfo(
             name=method.name,
@@ -122,9 +138,36 @@ class CodeGenerator(
                 else:
                     self._instance_init_sequence.append(("field", decl.name, decl.initializer))
 
+    def _process_imports(self, imports: tuple[ast.ImportDeclaration, ...]):
+        """Process import declarations for name resolution."""
+        for imp in imports:
+            if imp.is_static:
+                # TODO: Handle static imports
+                continue
+
+            if imp.is_wildcard:
+                # Wildcard import: import java.util.*;
+                self._wildcard_imports.append(imp.name.replace(".", "/"))
+            else:
+                # Single-type import: import java.util.List;
+                full_name = imp.name.replace(".", "/")
+                short_name = full_name.split("/")[-1]
+                self._single_type_imports[short_name] = full_name
+
     def compile(self, unit: ast.CompilationUnit) -> dict[str, bytes]:
         """Compile a compilation unit to class files."""
         results = {}
+
+        # Process imports for name resolution
+        self._process_imports(unit.imports)
+
+        # Store package prefix for class naming
+        package_prefix = ""
+        if unit.package:
+            package_prefix = unit.package.name.replace(".", "/") + "/"
+            self._current_package = package_prefix.rstrip("/")
+        else:
+            self._current_package = ""
 
         # Handle package-info.java (no types, but has package with annotations)
         if not unit.types and unit.package and unit.package.annotations:
@@ -133,14 +176,38 @@ class CodeGenerator(
             results[f"{package_path}/package-info"] = class_bytes
 
         for type_decl in unit.types:
+            # Prepend package to type name for bytecode generation
             if isinstance(type_decl, ast.ClassDeclaration):
-                class_bytes = self.compile_class(type_decl)
-                results[type_decl.name] = class_bytes
-                self._cache_compiled_class(type_decl.name, class_bytes)
+                # Temporarily modify the class name to include package
+                original_name = type_decl.name
+                if package_prefix:
+                    # Pass package prefix (with trailing /) so it's distinguished from nested class
+                    class_files = self.compile_class(type_decl, outer_class=package_prefix)
+                else:
+                    class_files = self.compile_class(type_decl)
+                for name, bytecode in class_files.items():
+                    results[name] = bytecode
+                    self._cache_compiled_class(name, bytecode)
             elif isinstance(type_decl, ast.InterfaceDeclaration):
-                class_bytes = self.compile_interface(type_decl)
-                results[type_decl.name] = class_bytes
-                self._cache_compiled_class(type_decl.name, class_bytes)
+                if package_prefix:
+                    class_bytes = self.compile_interface(type_decl, outer_class=package_prefix)
+                else:
+                    class_bytes = self.compile_interface(type_decl)
+                # Get the actual name from the compiled class
+                reader = ClassReader(class_bytes)
+                info = reader.read()
+                results[info.name] = class_bytes
+                self._cache_compiled_class(info.name, class_bytes)
+            elif isinstance(type_decl, ast.EnumDeclaration):
+                if package_prefix:
+                    class_bytes = self.compile_enum(type_decl, outer_class=package_prefix)
+                else:
+                    class_bytes = self.compile_enum(type_decl)
+                # Get the actual name from the compiled class
+                reader = ClassReader(class_bytes)
+                info = reader.read()
+                results[info.name] = class_bytes
+                self._cache_compiled_class(info.name, class_bytes)
         return results
 
     def _compile_package_info(self, pkg: ast.PackageDeclaration) -> bytes:
@@ -173,18 +240,64 @@ class CodeGenerator(
         except Exception as exc:
             raise CompileError(f"Failed to cache compiled class {internal_name}: {exc}") from exc
 
-    def compile_interface(self, iface: ast.InterfaceDeclaration) -> bytes:
-        """Compile an interface declaration."""
-        self.class_name = iface.name
+    def compile_interface(self, iface: ast.InterfaceDeclaration, outer_class: Optional[str] = None) -> bytes:
+        """Compile an interface declaration.
+        If outer_class contains '/', it's treated as a package prefix, otherwise as a nested class."""
+        if outer_class:
+            if "/" in outer_class:
+                # Package prefix (may have trailing /)
+                package = outer_class.rstrip("/")
+                self.class_name = f"{package}/{iface.name}"
+            else:
+                # Nested class
+                self.class_name = f"{outer_class}${iface.name}"
+        else:
+            self.class_name = iface.name
         self.super_class_name = "java/lang/Object"
-        self.class_file = ClassFile(iface.name, super_class=self.super_class_name)
+
+        # Check if we need Java 8 for default/static methods
+        needs_java8 = any(
+            isinstance(member, ast.MethodDeclaration) and member.body is not None
+            for member in iface.body
+        )
+        version = ClassFileVersion.JAVA_8 if needs_java8 else ClassFileVersion.JAVA_6
+
+        self.class_file = ClassFile(self.class_name, super_class=self.super_class_name, version=version)
         self.class_file.access_flags = AccessFlags.INTERFACE | AccessFlags.ABSTRACT
 
+        # Check for @FunctionalInterface annotation
+        has_functional_annotation = False
         for mod in iface.modifiers:
             if mod.keyword == "public":
                 self.class_file.access_flags |= AccessFlags.PUBLIC
             elif mod.keyword == "abstract":
                 self.class_file.access_flags |= AccessFlags.ABSTRACT
+            elif isinstance(mod, ast.Annotation) and mod.name == "FunctionalInterface":
+                has_functional_annotation = True
+
+        # Validate @FunctionalInterface if present
+        if has_functional_annotation:
+            abstract_methods = []
+            for member in iface.body:
+                if isinstance(member, ast.MethodDeclaration):
+                    is_abstract = True
+                    is_static = False
+                    has_default = False
+                    for m in member.modifiers:
+                        if m.keyword == "static":
+                            is_static = True
+                        elif m.keyword == "default":
+                            has_default = True
+                    if member.body is not None:
+                        is_abstract = False
+                    if is_abstract and not is_static and not has_default:
+                        abstract_methods.append(member.name)
+
+            if len(abstract_methods) != 1:
+                raise CompileError(f"@FunctionalInterface {iface.name} must have exactly one abstract method, found {len(abstract_methods)}: {', '.join(abstract_methods) if abstract_methods else 'none'}")
+
+        for mod in iface.modifiers:
+            pass  # Already processed above
 
         iface_names = []
         for ext in iface.extends:
@@ -218,16 +331,255 @@ class CodeGenerator(
 
         return self.class_file.to_bytes()
 
-    def compile_class(self, cls: ast.ClassDeclaration) -> bytes:
-        """Compile a class declaration."""
-        self.class_name = cls.name
+    def compile_enum(self, enum: ast.EnumDeclaration, outer_class: Optional[str] = None) -> bytes:
+        """Compile an enum declaration as a class extending java.lang.Enum.
+        If outer_class contains '/', it's treated as a package prefix, otherwise as a nested class."""
+        if outer_class:
+            if "/" in outer_class:
+                # Package prefix (may have trailing /)
+                package = outer_class.rstrip("/")
+                self.class_name = f"{package}/{enum.name}"
+            else:
+                # Nested class
+                self.class_name = f"{outer_class}${enum.name}"
+        else:
+            self.class_name = enum.name
+        self.super_class_name = "java/lang/Enum"
+        self.class_file = ClassFile(self.class_name, super_class=self.super_class_name)
+
+        # Enums are final classes with ENUM flag
+        flags = AccessFlags.SUPER | AccessFlags.FINAL | AccessFlags.ENUM
+        for mod in enum.modifiers:
+            if mod.keyword == "public":
+                flags |= AccessFlags.PUBLIC
+            elif mod.keyword == "private":
+                flags |= AccessFlags.PRIVATE
+            elif mod.keyword == "protected":
+                flags |= AccessFlags.PROTECTED
+        self.class_file.access_flags = flags
+
+        # Implement interfaces
+        iface_names = []
+        for iface_type in enum.implements:
+            resolved = self.resolve_type(iface_type)
+            if isinstance(resolved, ClassJType):
+                iface_names.append(resolved.internal_name())
+            else:
+                iface_names.append(str(resolved))
+        self.class_file.interfaces = iface_names
+
+        # Generate generic signature: Enum<EnumName>
+        self.class_file.signature = f"Ljava/lang/Enum<L{enum.name};>;"
+
+        self._class_type_params = set()
+        self._local_methods = {}
+        self._local_fields = {}
+        self._static_init_sequence = []
+        self._instance_init_sequence = []
+
+        # Register enum constants as fields
+        for const in enum.constants:
+            self._local_fields[const.name] = LocalFieldInfo(
+                name=const.name,
+                jtype=ClassJType(enum.name),
+                descriptor=f"L{enum.name};",
+                is_static=True,
+            )
+
+        # Register methods from body
+        for member in enum.body:
+            if isinstance(member, ast.MethodDeclaration):
+                self._register_local_method(member)
+            elif isinstance(member, ast.FieldDeclaration):
+                self._register_local_field(member)
+
+        # Add enum constant fields
+        for const in enum.constants:
+            field_info = FieldInfo(
+                access_flags=AccessFlags.PUBLIC | AccessFlags.STATIC | AccessFlags.FINAL | AccessFlags.ENUM,
+                name=const.name,
+                descriptor=f"L{enum.name};",
+                annotations=self._convert_annotations(const.annotations),
+            )
+            self.class_file.add_field(field_info)
+
+        # Add synthetic $VALUES array field
+        values_field = FieldInfo(
+            access_flags=AccessFlags.PRIVATE | AccessFlags.STATIC | AccessFlags.FINAL | AccessFlags.SYNTHETIC,
+            name="$VALUES",
+            descriptor=f"[L{enum.name};",
+        )
+        self.class_file.add_field(values_field)
+
+        # Compile methods from body
+        for member in enum.body:
+            if isinstance(member, ast.MethodDeclaration):
+                self.compile_method(member)
+            elif isinstance(member, ast.FieldDeclaration):
+                self.compile_field(member)
+
+        # Generate private constructor: (String, int)
+        self._generate_enum_constructor(enum)
+
+        # Generate static initializer that creates enum constants
+        self._generate_enum_static_initializer(enum)
+
+        # Generate values() method
+        self._generate_enum_values_method(enum)
+
+        # Generate valueOf(String) method
+        self._generate_enum_valueof_method(enum)
+
+        return self.class_file.to_bytes()
+
+    def _generate_enum_constructor(self, enum: ast.EnumDeclaration):
+        """Generate private constructor for enum: (String name, int ordinal)"""
+        builder = BytecodeBuilder(self.class_file.cp)
+        ctx = MethodContext(
+            class_name=self.class_name,
+            method_name="<init>",
+            return_type=VOID,
+            builder=builder,
+        )
+
+        # this, name, ordinal
+        ctx.add_local("this", ClassJType(self.class_name))
+        ctx.add_local("name", ClassJType("java/lang/String"))
+        ctx.add_local("ordinal", INT)
+
+        # Call super(String, int)
+        builder.aload(0)  # this
+        builder.aload(1)  # name
+        builder.iload(2)  # ordinal
+        builder.invokespecial("java/lang/Enum", "<init>", "(Ljava/lang/String;I)V", 3, 0)
+
+        builder.return_()
+
+        method_info = MethodInfo(
+            access_flags=AccessFlags.PRIVATE,
+            name="<init>",
+            descriptor="(Ljava/lang/String;I)V",
+            code=builder.build(),
+        )
+        self.class_file.add_method(method_info)
+
+    def _generate_enum_static_initializer(self, enum: ast.EnumDeclaration):
+        """Generate <clinit> that initializes enum constants."""
+        builder = BytecodeBuilder(self.class_file.cp)
+        ctx = MethodContext(
+            class_name=self.class_name,
+            method_name="<clinit>",
+            return_type=VOID,
+            builder=builder,
+        )
+
+        # Create each enum constant
+        for ordinal, const in enumerate(enum.constants):
+            # new EnumName("CONST_NAME", ordinal)
+            builder.new(self.class_name)
+            builder.dup()
+            builder.ldc_string(const.name)
+            builder.iconst(ordinal)
+            builder.invokespecial(self.class_name, "<init>", "(Ljava/lang/String;I)V", 3, 0)
+            # Store in static field
+            builder.putstatic(self.class_name, const.name, f"L{self.class_name};")
+
+        # Create $VALUES array
+        builder.iconst(len(enum.constants))
+        builder.anewarray(self.class_name)
+
+        # Fill array
+        for ordinal, const in enumerate(enum.constants):
+            builder.dup()
+            builder.iconst(ordinal)
+            builder.getstatic(self.class_name, const.name, f"L{self.class_name};")
+            builder.aastore()
+
+        # Store in $VALUES
+        builder.putstatic(self.class_name, "$VALUES", f"[L{self.class_name};")
+
+        builder.return_()
+
+        method_info = MethodInfo(
+            access_flags=AccessFlags.STATIC,
+            name="<clinit>",
+            descriptor="()V",
+            code=builder.build(),
+        )
+        self.class_file.add_method(method_info)
+
+    def _generate_enum_values_method(self, enum: ast.EnumDeclaration):
+        """Generate public static values() method."""
+        builder = BytecodeBuilder(self.class_file.cp)
+        ctx = MethodContext(
+            class_name=self.class_name,
+            method_name="values",
+            return_type=ArrayJType(ClassJType(self.class_name), 1),
+            builder=builder,
+        )
+
+        # return $VALUES.clone()
+        builder.getstatic(self.class_name, "$VALUES", f"[L{self.class_name};")
+        builder.invokevirtual(f"[L{self.class_name};", "clone", "()Ljava/lang/Object;", 0, 1)
+        builder.checkcast(f"[L{self.class_name};")
+        builder.areturn()
+
+        method_info = MethodInfo(
+            access_flags=AccessFlags.PUBLIC | AccessFlags.STATIC,
+            name="values",
+            descriptor=f"()[L{self.class_name};",
+            code=builder.build(),
+        )
+        self.class_file.add_method(method_info)
+
+    def _generate_enum_valueof_method(self, enum: ast.EnumDeclaration):
+        """Generate public static valueOf(String) method."""
+        builder = BytecodeBuilder(self.class_file.cp)
+        ctx = MethodContext(
+            class_name=self.class_name,
+            method_name="valueOf",
+            return_type=ClassJType(self.class_name),
+            builder=builder,
+        )
+        ctx.add_local("name", ClassJType("java/lang/String"))
+
+        # return Enum.valueOf(EnumName.class, name)
+        builder.ldc_class(self.class_name)
+        builder.aload(0)  # name parameter
+        builder.invokestatic("java/lang/Enum", "valueOf", "(Ljava/lang/Class;Ljava/lang/String;)Ljava/lang/Enum;", 2, 1)
+        builder.checkcast(self.class_name)
+        builder.areturn()
+
+        method_info = MethodInfo(
+            access_flags=AccessFlags.PUBLIC | AccessFlags.STATIC,
+            name="valueOf",
+            descriptor=f"(Ljava/lang/String;)L{self.class_name};",
+            code=builder.build(),
+        )
+        self.class_file.add_method(method_info)
+
+    def compile_class(self, cls: ast.ClassDeclaration, outer_class: Optional[str] = None) -> dict[str, bytes]:
+        """Compile a class declaration. Returns dict of class_name -> bytecode.
+        For nested classes, includes both outer and inner class files.
+        If outer_class contains '/', it's treated as a package prefix, otherwise as a nested class."""
+        # Determine the full class name (Outer$Inner for nested classes, package/Class for packages)
+        if outer_class:
+            if "/" in outer_class:
+                # Package prefix (may have trailing /)
+                package = outer_class.rstrip("/")
+                self.class_name = f"{package}/{cls.name}"
+            else:
+                # Nested class
+                self.class_name = f"{outer_class}${cls.name}"
+        else:
+            self.class_name = cls.name
         self.super_class_name = "java/lang/Object"
         if cls.extends:
             super_type = self.resolve_type(cls.extends)
             if not isinstance(super_type, ClassJType):
                 raise CompileError("Superclass must be a class type")
             self.super_class_name = super_type.internal_name()
-        self.class_file = ClassFile(cls.name, super_class=self.super_class_name)
+        self.class_file = ClassFile(self.class_name, super_class=self.super_class_name)
         iface_names = []
         for iface_type in cls.implements:
             resolved = self.resolve_type(iface_type)
@@ -265,23 +617,92 @@ class CodeGenerator(
         # Generate class signature for generics
         self.class_file.signature = self._generate_class_signature(cls)
 
+        # Set up type parameters for type erasure
+        self._type_params = {tp.name: tp for tp in cls.type_parameters}
+
+        # Store class type parameters for method signature generation
+        self.current_class_type_params = cls.type_parameters
+
         # First pass: collect field and method signatures for forward references
         self._local_methods = {}
         self._local_fields = {}
         self._static_init_sequence = []
         self._instance_init_sequence = []
+
+        # Register outer class fields and methods BEFORE compiling nested classes
+        # (so nested classes can access them)
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
                 self._register_local_method(member)
             elif isinstance(member, ast.FieldDeclaration):
                 self._register_local_field(member)
+
+        # First pass: compile nested classes (they need to be available for lookup)
+        # Save current state before compiling nested classes
+        saved_class_name = self.class_name
+        saved_class_file = self.class_file
+        saved_super_class = self.super_class_name
+        saved_static_init_sequence = list(self._static_init_sequence)  # Make a copy
+        saved_instance_init_sequence = list(self._instance_init_sequence)  # Make a copy
+        saved_local_methods = dict(self._local_methods)  # Make a copy
+        saved_local_fields = dict(self._local_fields)  # Make a copy
+
+        nested_classes = {}
+        for member in cls.body:
+            if isinstance(member, ast.ClassDeclaration):
+                nested_results = self.compile_class(member, outer_class=saved_class_name)
+                nested_classes.update(nested_results)
+                # Cache the nested classes immediately
+                for name, bytecode in nested_results.items():
+                    self._cache_compiled_class(name, bytecode)
+            elif isinstance(member, ast.InterfaceDeclaration):
+                nested_bytecode = self.compile_interface(member, outer_class=saved_class_name)
+                nested_name = f"{saved_class_name}${member.name}"
+                nested_classes[nested_name] = nested_bytecode
+                self._cache_compiled_class(nested_name, nested_bytecode)
+            elif isinstance(member, ast.EnumDeclaration):
+                nested_bytecode = self.compile_enum(member, outer_class=saved_class_name)
+                nested_name = f"{saved_class_name}${member.name}"
+                nested_classes[nested_name] = nested_bytecode
+                self._cache_compiled_class(nested_name, nested_bytecode)
+
+        # Restore state after compiling nested classes
+        self.class_name = saved_class_name
+        self.class_file = saved_class_file
+        self.super_class_name = saved_super_class
+        self._static_init_sequence = saved_static_init_sequence
+        self._instance_init_sequence = saved_instance_init_sequence
+        self._local_methods = saved_local_methods
+        self._local_fields = saved_local_fields
+
+        # Check if this is a non-static inner class
+        # (outer_class with "/" is a package prefix, not an outer class)
+        is_static = any(mod.keyword == "static" for mod in cls.modifiers)
+        is_package = outer_class and "/" in outer_class
+        self.is_inner_class = outer_class is not None and not is_static and not is_package
+        self.outer_class_name = outer_class if self.is_inner_class else None
+
+        # For non-static inner classes, add synthetic this$0 field
+        if self.is_inner_class:
+            this0_field = FieldInfo(
+                name="this$0",
+                descriptor=f"L{outer_class};",
+                access_flags=AccessFlags.FINAL | AccessFlags.SYNTHETIC
+            )
+            self.class_file.add_field(this0_field)
+            # Register in _local_fields for method resolution
+            self._local_fields["this$0"] = ClassJType(outer_class)
+
+        # Second pass: collect field initializers and initializer blocks
+        for member in cls.body:
+            if isinstance(member, ast.FieldDeclaration):
                 self._collect_field_initializers(member)
             elif isinstance(member, ast.StaticInitializer):
                 self._static_init_sequence.append(("block", member.body))
             elif isinstance(member, ast.InstanceInitializer):
                 self._instance_init_sequence.append(("block", member.body))
 
-        # Second pass: compile members
+        # Third pass: compile members
         has_constructor = False
         for member in cls.body:
             if isinstance(member, ast.MethodDeclaration):
@@ -303,7 +724,66 @@ class CodeGenerator(
             if not (self.class_file.access_flags & AccessFlags.ABSTRACT):
                 raise CompileError(f"Class {cls.name} contains abstract methods but is not abstract")
 
-        return self.class_file.to_bytes()
+        # Add InnerClasses attribute entries
+        from ..classfile import InnerClassInfo
+        if outer_class:
+            # This is a nested class - add entry for itself
+            # Determine access flags from class modifiers
+            inner_flags = 0
+            for mod in cls.modifiers:
+                if mod.keyword == "public":
+                    inner_flags |= AccessFlags.PUBLIC
+                elif mod.keyword == "private":
+                    inner_flags |= AccessFlags.PRIVATE
+                elif mod.keyword == "protected":
+                    inner_flags |= AccessFlags.PROTECTED
+                elif mod.keyword == "static":
+                    inner_flags |= AccessFlags.STATIC
+                elif mod.keyword == "final":
+                    inner_flags |= AccessFlags.FINAL
+                elif mod.keyword == "abstract":
+                    inner_flags |= AccessFlags.ABSTRACT
+            self.class_file.inner_classes.append(
+                InnerClassInfo(
+                    inner_class=self.class_name,  # e.g., "Outer$Inner"
+                    outer_class=outer_class,      # e.g., "Outer"
+                    inner_name=cls.name,          # e.g., "Inner"
+                    access_flags=inner_flags
+                )
+            )
+        else:
+            # This is an outer class - add entries for all nested classes
+            for member in cls.body:
+                if isinstance(member, ast.ClassDeclaration):
+                    nested_name = f"{self.class_name}${member.name}"
+                    # Determine access flags from nested class modifiers
+                    inner_flags = 0
+                    for mod in member.modifiers:
+                        if mod.keyword == "public":
+                            inner_flags |= AccessFlags.PUBLIC
+                        elif mod.keyword == "private":
+                            inner_flags |= AccessFlags.PRIVATE
+                        elif mod.keyword == "protected":
+                            inner_flags |= AccessFlags.PROTECTED
+                        elif mod.keyword == "static":
+                            inner_flags |= AccessFlags.STATIC
+                        elif mod.keyword == "final":
+                            inner_flags |= AccessFlags.FINAL
+                        elif mod.keyword == "abstract":
+                            inner_flags |= AccessFlags.ABSTRACT
+                    self.class_file.inner_classes.append(
+                        InnerClassInfo(
+                            inner_class=nested_name,     # e.g., "Outer$Inner"
+                            outer_class=self.class_name, # e.g., "Outer"
+                            inner_name=member.name,      # e.g., "Inner"
+                            access_flags=inner_flags
+                        )
+                    )
+
+        # Return all class files (this class + nested classes)
+        result = {self.class_name: self.class_file.to_bytes()}
+        result.update(nested_classes)
+        return result
 
     def compile_field(self, fld: ast.FieldDeclaration):
         """Compile a field declaration."""
@@ -323,7 +803,12 @@ class CodeGenerator(
         jtype = self.resolve_type(fld.type)
         annotations = self._convert_annotations(fld.modifiers)
         for decl in fld.declarators:
-            const_value = self._constant_value_attribute(jtype, decl.initializer) if decl.initializer else None
+            # ConstantValue attribute only for static final fields
+            is_static = flags & AccessFlags.STATIC
+            is_final = flags & AccessFlags.FINAL
+            const_value = None
+            if is_static and is_final and decl.initializer:
+                const_value = self._constant_value_attribute(jtype, decl.initializer)
             field_info = FieldInfo(
                 access_flags=flags,
                 name=decl.name,
@@ -344,7 +829,21 @@ class CodeGenerator(
         )
         ctx.add_local("this", ClassJType(self.class_name))
 
+        # For inner classes, add outer instance parameter
+        if self.is_inner_class:
+            ctx.add_local("this$0", ClassJType(self.outer_class_name))
+            descriptor = f"(L{self.outer_class_name};)V"
+        else:
+            descriptor = "()V"
+
         self._invoke_super_constructor((), ctx)
+
+        # For inner classes, store outer instance in this$0 field
+        if self.is_inner_class:
+            builder.aload(0)  # load this
+            builder.aload(1)  # load outer instance
+            builder.putfield(self.class_name, "this$0", f"L{self.outer_class_name};")
+
         self._emit_instance_initializers(ctx)
         builder.return_()
 
@@ -352,7 +851,7 @@ class CodeGenerator(
         method_info = MethodInfo(
             access_flags=AccessFlags.PUBLIC,
             name="<init>",
-            descriptor="()V",
+            descriptor=descriptor,
             code=code_attr,
         )
         self.class_file.add_method(method_info)
@@ -370,7 +869,12 @@ class CodeGenerator(
 
         # Build method descriptor
         param_types = [self._resolve_parameter_type(p) for p in ctor.parameters]
-        descriptor = "(" + "".join(t.descriptor() for t in param_types) + ")V"
+
+        # For inner classes, prepend outer instance to descriptor
+        if self.is_inner_class:
+            descriptor = f"(L{self.outer_class_name};{''.join(t.descriptor() for t in param_types)})V"
+        else:
+            descriptor = "(" + "".join(t.descriptor() for t in param_types) + ")V"
 
         # Collect parameter names and annotations for reflection
         parameter_names = [p.name for p in ctor.parameters]
@@ -387,6 +891,10 @@ class CodeGenerator(
         # 'this' is slot 0
         ctx.add_local("this", ClassJType(self.class_name))
 
+        # For inner classes, add outer instance as first parameter
+        if self.is_inner_class:
+            ctx.add_local("this$0", ClassJType(self.outer_class_name))
+
         # Add parameters
         for param, jtype in zip(ctor.parameters, param_types):
             ctx.add_local(param.name, jtype)
@@ -399,6 +907,12 @@ class CodeGenerator(
             body_statements = body_statements[1:]
         else:
             self._invoke_super_constructor((), ctx)
+
+        # For inner classes, store outer instance in this$0 field
+        if self.is_inner_class:
+            builder.aload(0)  # load this
+            builder.aload(1)  # load outer instance (first parameter after this)
+            builder.putfield(self.class_name, "this$0", f"L{self.outer_class_name};")
 
         self._emit_instance_initializers(ctx)
 
@@ -553,7 +1067,12 @@ class CodeGenerator(
         jtype = self.resolve_type(fld.type)
         annotations = self._convert_annotations(fld.modifiers)
         for decl in fld.declarators:
-            const_value = self._constant_value_attribute(jtype, decl.initializer) if decl.initializer else None
+            # ConstantValue attribute only for static final fields
+            is_static = flags & AccessFlags.STATIC
+            is_final = flags & AccessFlags.FINAL
+            const_value = None
+            if is_static and is_final and decl.initializer:
+                const_value = self._constant_value_attribute(jtype, decl.initializer)
             field_info = FieldInfo(
                 access_flags=flags,
                 name=decl.name,
@@ -671,10 +1190,21 @@ class CodeGenerator(
         if method.parameters and method.parameters[-1].varargs:
             flags |= AccessFlags.VARARGS
 
-        # Build method descriptor
+        # Save class-level type params and add method type params for erasure
+        saved_type_params = self._type_params.copy() if hasattr(self, '_type_params') else {}
+        if not hasattr(self, '_type_params'):
+            self._type_params = {}
+        for tp in method.type_parameters:
+            self._type_params[tp.name] = tp
+
+        # Build method descriptor (with type erasure)
         param_types = [self._resolve_parameter_type(p) for p in method.parameters]
         return_type = self.resolve_type(method.return_type)
         descriptor = MethodType(return_type, tuple(param_types)).descriptor()
+
+        # Generate method signature for generics
+        class_type_params = {tp.name for tp in getattr(self, 'current_class_type_params', [])}
+        method_signature = self._generate_method_signature(method, class_type_params)
 
         # Collect annotations
         annotations = self._convert_annotations(method.modifiers)
@@ -694,12 +1224,15 @@ class CodeGenerator(
                 name=method.name,
                 descriptor=descriptor,
                 code=None,
+                signature=method_signature,
                 annotations=annotations,
                 exceptions=throws_list,
                 parameter_names=parameter_names,
                 parameter_annotations=parameter_annotations,
             )
             self.class_file.add_method(method_info)
+            # Restore class-level type params
+            self._type_params = saved_type_params
             return
 
         builder = BytecodeBuilder(self.class_file.cp)
@@ -730,6 +1263,7 @@ class CodeGenerator(
             name=method.name,
             descriptor=descriptor,
             code=builder.build(),
+            signature=method_signature,
             annotations=annotations,
             exceptions=throws_list,
             parameter_names=parameter_names,
@@ -737,6 +1271,100 @@ class CodeGenerator(
         )
         self.class_file.add_method(method_info)
 
+        # Generate bridge method if needed
+        if not is_static and not method.name.startswith("<"):
+            self._generate_bridge_method_if_needed(method, descriptor, return_type, param_types)
+
+        # Restore class-level type params
+        self._type_params = saved_type_params
+
+    def _generate_bridge_method_if_needed(self, method: ast.MethodDeclaration,
+                                          child_descriptor: str,
+                                          child_return_type: JType,
+                                          child_param_types: list[JType]):
+        """Generate a bridge method if the child method has a different descriptor than the parent."""
+        # Only for classes with a superclass
+        if not hasattr(self, 'super_class_name') or not self.super_class_name:
+            return
+
+        # Look for a method with the same name in the superclass
+        parent_method = self._find_method(self.super_class_name, method.name, child_param_types)
+        if not parent_method:
+            return
+
+        # If descriptors are the same, no bridge needed
+        if parent_method.descriptor == child_descriptor:
+            return
+
+        # Generate bridge method with parent's descriptor
+        builder = BytecodeBuilder(self.class_file.cp)
+
+        # Load 'this'
+        builder.aload(0)
+
+        # Load and convert arguments
+        slot = 1  # Slot 0 is 'this'
+        for i, parent_param_type in enumerate(parent_method.param_types):
+            # Load argument
+            if parent_param_type == LONG or parent_param_type == DOUBLE:
+                if parent_param_type == LONG:
+                    builder.lload(slot)
+                else:
+                    builder.dload(slot)
+                slot += 2
+            elif parent_param_type.is_reference:
+                builder.aload(slot)
+                # Cast to child parameter type if needed
+                if i < len(child_param_types):
+                    child_param_type = child_param_types[i]
+                    if child_param_type != parent_param_type:
+                        builder.checkcast(child_param_type.internal_name())
+                slot += 1
+            else:  # int, float, boolean, etc.
+                if parent_param_type == FLOAT:
+                    builder.fload(slot)
+                else:
+                    builder.iload(slot)
+                slot += 1
+
+        # Call the real method
+        builder.invokevirtual(
+            self.class_name,
+            method.name,
+            child_descriptor,
+            sum(t.size for t in child_param_types) + 1,  # +1 for 'this'
+            0 if child_return_type == VOID else child_return_type.size
+        )
+
+        # Return
+        if child_return_type == VOID:
+            builder.return_()
+        elif child_return_type == LONG:
+            builder.lreturn()
+        elif child_return_type == DOUBLE:
+            builder.dreturn()
+        elif child_return_type == FLOAT:
+            builder.freturn()
+        elif child_return_type.is_reference:
+            builder.areturn()
+        else:
+            builder.ireturn()
+
+        # Set max_locals: 1 (this) + sum of parameter sizes
+        builder.max_locals = 1 + sum(t.size for t in parent_method.param_types)
+
+        # Create bridge method info
+        bridge_method = MethodInfo(
+            access_flags=AccessFlags.PUBLIC | AccessFlags.BRIDGE | AccessFlags.SYNTHETIC,
+            name=method.name,
+            descriptor=parent_method.descriptor,
+            code=builder.build(),
+            annotations=[],
+            exceptions=[],
+            parameter_names=[],
+            parameter_annotations=[],
+        )
+        self.class_file.add_method(bridge_method)
 
 
 def compile_file(source_path: str, output_dir: str = ".", use_rt_jar: bool = True):
@@ -765,6 +1393,8 @@ def compile_file(source_path: str, output_dir: str = ".", use_rt_jar: bool = Tru
 
     for name, bytecode in class_files.items():
         class_path = output_path / f"{name}.class"
+        # Create package directories if needed
+        class_path.parent.mkdir(parents=True, exist_ok=True)
         with open(class_path, "wb") as f:
             f.write(bytecode)
         print(f"Wrote {class_path}")
