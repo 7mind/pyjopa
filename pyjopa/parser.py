@@ -1947,7 +1947,15 @@ class Java8Transformer(Transformer):
         return ".".join(parts)
 
     def arguments(self, items):
-        return tuple(item for item in items if isinstance(item, ast.Expression))
+        # argument_list returns a tuple of expressions, so we need to flatten it
+        result = []
+        for item in items:
+            if isinstance(item, ast.Expression):
+                result.append(item)
+            elif isinstance(item, tuple) and item and isinstance(item[0], ast.Expression):
+                # This is the result from argument_list - extend with all expressions
+                result.extend(item)
+        return tuple(result)
 
     # ==================== HELPERS ====================
 
