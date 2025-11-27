@@ -675,7 +675,7 @@ class ClassFile:
     MAGIC = 0xCAFEBABE
 
     def __init__(self, name: str, super_class: str = "java/lang/Object",
-                 version: tuple[int, int] = ClassFileVersion.JAVA_8):
+                 version: tuple[int, int] = ClassFileVersion.JAVA_6):
         self.version = version
         self.access_flags = AccessFlags.PUBLIC | AccessFlags.SUPER
         self.name = name

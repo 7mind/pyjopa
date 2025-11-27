@@ -639,7 +639,12 @@ class CodeGenerator(
             if not isinstance(super_type, ClassJType):
                 raise CompileError("Superclass must be a class type")
             self.super_class_name = super_type.internal_name()
-        self.class_file = ClassFile(self.class_name, super_class=self.super_class_name)
+
+        # Detect if class uses Java 8 features (lambdas)
+        needs_java8 = self._has_lambdas(cls)
+        version = ClassFileVersion.JAVA_8 if needs_java8 else ClassFileVersion.JAVA_6
+
+        self.class_file = ClassFile(self.class_name, super_class=self.super_class_name, version=version)
         iface_names = []
         for iface_type in cls.implements:
             resolved = self.resolve_type(iface_type)
@@ -1474,6 +1479,22 @@ class CodeGenerator(
             parameter_annotations=[],
         )
         self.class_file.add_method(bridge_method)
+
+    def _has_lambdas(self, node) -> bool:
+        """Recursively check if AST node contains lambda expressions."""
+        if isinstance(node, ast.LambdaExpression):
+            return True
+        if isinstance(node, list):
+            return any(self._has_lambdas(item) for item in node)
+        if hasattr(node, '__dict__'):
+            for value in node.__dict__.values():
+                if isinstance(value, (list, tuple)):
+                    if any(self._has_lambdas(item) for item in value):
+                        return True
+                elif hasattr(value, '__dict__'):
+                    if self._has_lambdas(value):
+                        return True
+        return False
 
 
 def compile_file(source_path: str, output_dir: str = ".", use_rt_jar: bool = True):
