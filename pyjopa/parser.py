@@ -586,13 +586,15 @@ class Java8Transformer(Transformer):
             annotations=tuple(annotations)
         )
 
+    def dim(self, items):
+        # Each dim rule represents one [] pair (possibly with annotations)
+        # We only care about annotations for now, but we return 1 to count this dimension
+        return 1
+
     def dims(self, items):
-        count = 0
-        for item in items:
-            if item == "[" or item == "]":
-                pass
-            count += 1
-        return max(1, count // 2) if count > 0 else 1
+        # items contains the count from each dim rule
+        # Sum them up to get total dimensions
+        return sum(items)
 
     # ==================== TYPE PARAMETERS ====================
 

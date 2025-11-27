@@ -139,7 +139,8 @@ class_type_list: class_type ("," class_type)*
 array_type: primitive_type dims
           | class_type dims
 
-dims: (annotation* "[" "]")+
+dims: dim+
+dim: annotation* "[" "]"
 
 // ==================== TYPE PARAMETERS AND ARGUMENTS ====================
 

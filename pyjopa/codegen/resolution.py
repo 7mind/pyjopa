@@ -629,10 +629,11 @@ class ResolutionMixin:
 
         elif isinstance(t, ast.ArrayType):
             elem = self.resolve_type(t.element_type)
-            result = ArrayJType(elem, t.dimensions)
-            import sys
-            print(f"DEBUG resolve_type: ArrayType -> {result}, elem={elem}, dims={t.dimensions}", file=sys.stderr)
-            return result
+            # If element is already an ArrayJType, flatten the dimensions
+            if isinstance(elem, ArrayJType):
+                return ArrayJType(elem.element_type, elem.dimensions + t.dimensions)
+            else:
+                return ArrayJType(elem, t.dimensions)
 
         else:
             raise CompileError(f"Unsupported type: {type(t).__name__}")
