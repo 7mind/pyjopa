@@ -15,20 +15,19 @@ except FileNotFoundError:
     print("Warning: rt.jar not found")
 
 try:
-    ast = parser.parse_file('tests/integration/cat12_lambda_runnable.java')
+    # Test the failing lambda function test instead
+    ast = parser.parse_file('tests/integration/cat12_lambda_function.java')
     codegen = CodeGenerator(classpath=classpath)
 
-    # Compile but don't cache (to avoid the caching error)
-    codegen.compile_ast(ast)
+    # Compile using the correct method
+    class_files = codegen.compile(ast)
 
-    # Get the raw bytecode
-    bytecode = codegen.class_file.to_bytes()
-
-    # Write it to a file
-    with open('TestLambdaRunnable.class', 'wb') as f:
-        f.write(bytecode)
-
-    print(f"Wrote {len(bytecode)} bytes to TestLambdaRunnable.class")
+    # Write bytecode
+    for internal_name, bytecode in class_files.items():
+        filename = f"{internal_name.replace('/', '_')}.class"
+        with open(filename, 'wb') as f:
+            f.write(bytecode)
+        print(f"Wrote {len(bytecode)} bytes to {filename}")
 
 except Exception as e:
     print(f"Error: {e}")

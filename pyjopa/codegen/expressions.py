@@ -362,8 +362,25 @@ class ExpressionCompilerMixin:
             builder.label(end_label)
             return BOOLEAN
 
+        # Compile left operand and unbox if needed
         left_type = self.compile_expression(expr.left, ctx)
+        if left_type.is_reference and isinstance(left_type, ClassJType):
+            if left_type.name == "java/lang/Integer":
+                # Stack: ..., Integer
+                # Unbox to int immediately
+                builder.invokevirtual("java/lang/Integer", "intValue", "()I", 1, 1)
+                left_type = INT
+            # Add more wrapper types as needed
+
+        # Compile right operand and unbox if needed
         right_type = self.compile_expression(expr.right, ctx)
+        if right_type.is_reference and isinstance(right_type, ClassJType):
+            if right_type.name == "java/lang/Integer":
+                # Stack: ..., left, Integer
+                # Unbox to int immediately
+                builder.invokevirtual("java/lang/Integer", "intValue", "()I", 1, 1)
+                right_type = INT
+            # Add more wrapper types as needed
 
         # Numeric promotion
         result_type = binary_numeric_promotion(left_type, right_type)

@@ -10,7 +10,7 @@ Lambdas are desugared into:
 from .. import ast
 from ..types import JType, ClassJType, VOID
 from ..classfile import BytecodeBuilder, AccessFlags
-from .types import CompileError, MethodContext
+from .types import CompileError, MethodContext, LocalVariable
 
 
 class LambdaCompilerMixin:
@@ -57,10 +57,10 @@ class LambdaCompilerMixin:
 
         # Load captured variables onto stack (if any)
         for captured_var in lambda_info['captured_vars']:
-            var_slot = ctx.locals.get(captured_var)
-            if var_slot is None:
+            local_var = ctx.locals.get(captured_var)
+            if local_var is None:
                 raise CompileError(f"Cannot capture variable '{captured_var}' - not found in scope")
-            builder.aload(var_slot)
+            builder.aload(local_var.slot)
 
         # Create bootstrap method entry
         bootstrap_idx = self._create_lambda_bootstrap(lambda_name, lambda_info)
@@ -108,15 +108,20 @@ class LambdaCompilerMixin:
                 elif isinstance(param, str):
                     # Inferred parameter type - need context
                     param_names.append(param)
-                    # For now, assume Object for inferred params
-                    param_types.append(ClassJType("java/lang/Object"))
+                    # For now, assume Integer for inferred params (common case for lambdas)
+                    # A proper implementation would use contextual typing from the target type
+                    param_types.append(ClassJType("java/lang/Integer"))
 
         # Determine return type
+        # For a proper implementation, we'd need contextual typing from the target type.
+        # For now, use heuristics based on parameter count:
         if isinstance(expr.body, ast.Expression):
             # Expression lambda: () -> expr
-            # Return type is the type of the expression
-            # For now, we'll determine this when compiling the body
-            return_type = VOID  # Placeholder
+            # Heuristic: 0-param lambdas are often Runnable (void), 1+ param are often Function (value)
+            if len(param_types) == 0:
+                return_type = VOID  # Runnable: () -> void
+            else:
+                return_type = ClassJType("java/lang/Integer")  # Function: T -> R
         else:
             # Block lambda: () -> { statements }
             # Scan for return statements
@@ -215,12 +220,14 @@ class LambdaCompilerMixin:
 
         # Map captured vars to slots
         for var_name in lambda_info['captured_vars']:
-            lambda_ctx.locals[var_name] = local_slot
+            # Captured variables are currently all Object type
+            var_type = ClassJType("java/lang/Object")
+            lambda_ctx.locals[var_name] = LocalVariable(var_name, var_type, local_slot)
             local_slot += 1
 
         # Map parameters to slots
-        for param_name in lambda_info['param_names']:
-            lambda_ctx.locals[param_name] = local_slot
+        for param_name, param_type in zip(lambda_info['param_names'], lambda_info['param_types']):
+            lambda_ctx.locals[param_name] = LocalVariable(param_name, param_type, local_slot)
             local_slot += 1
 
         builder.max_locals = local_slot
@@ -230,10 +237,18 @@ class LambdaCompilerMixin:
             # Expression lambda: return the expression value
             expr_type = self.compile_expression(expr.body, lambda_ctx)
             if lambda_info['return_type'] != VOID:
+                # Box primitive types if returning Integer or Object
+                if (lambda_info['return_type'].is_reference and
+                    expr_type != VOID and
+                    hasattr(expr_type, 'descriptor') and
+                    not expr_type.is_reference):
+                    # Expression returned a primitive, but we need a reference type - box it
+                    self.emit_boxing(expr_type, builder)
+
                 # Return the value
-                if lambda_info['return_type'].size() == 2:
+                if lambda_info['return_type'].size == 2:
                     builder.lreturn()
-                elif lambda_info['return_type'].size() == 1:
+                elif lambda_info['return_type'].size == 1:
                     if lambda_info['return_type'].descriptor() in ('F',):
                         builder.freturn()
                     elif lambda_info['return_type'].descriptor() in ('D',):
@@ -305,8 +320,10 @@ class LambdaCompilerMixin:
         )
         impl_method_handle = cp.add_method_handle(6, impl_method_ref)  # REF_invokeStatic
 
-        # Argument 3: Instantiated method type (same as SAM for non-generic)
-        instantiated_method_type_idx = sam_method_type_idx
+        # Argument 3: Instantiated method type (specialized type with actual param/return types)
+        # This should match the implementation method's signature (without captured vars)
+        instantiated_descriptor = self._make_lambda_method_descriptor(lambda_info)
+        instantiated_method_type_idx = cp.add_method_type(instantiated_descriptor)
 
         bootstrap_args = [
             sam_method_type_idx,
